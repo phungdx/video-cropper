@@ -207,12 +207,35 @@ function drawSourceOverlay(
   const scaleX = canvasSize.width / frame.width;
   const scaleY = canvasSize.height / frame.height;
 
-  detections.forEach((detection) => {
-    const highlight = trackedBox ? detection.box.x === trackedBox.x && detection.box.y === trackedBox.y : false;
-    drawDetectionBox(ctx, detection, scaleX, scaleY, highlight);
-  });
-
   if (trackedBox) {
+    const selectedDetection = detections.reduce<Detection | null>((best, detection) => {
+      if (!best) {
+        return detection;
+      }
+
+      const bestScore = Math.abs(best.box.x - trackedBox.x) + Math.abs(best.box.y - trackedBox.y);
+      const candidateScore =
+        Math.abs(detection.box.x - trackedBox.x) + Math.abs(detection.box.y - trackedBox.y);
+
+      return candidateScore < bestScore ? detection : best;
+    }, null);
+
+    if (selectedDetection) {
+      drawDetectionBox(ctx, selectedDetection, scaleX, scaleY, true);
+    } else {
+      drawDetectionBox(
+        ctx,
+        {
+          label: 'person',
+          score: 1,
+          box: trackedBox,
+        },
+        scaleX,
+        scaleY,
+        true,
+      );
+    }
+
     ctx.save();
     ctx.strokeStyle = '#61f0d2';
     ctx.lineWidth = 5;
@@ -224,8 +247,15 @@ function drawSourceOverlay(
       trackedBox.height * scaleY,
     );
     ctx.restore();
-  } else if (detections.length === 0) {
-    drawBanner(ctx, 'Waiting for a person', canvasSize, 'Pause on a clear frame, then click the person to lock on.');
+  } else {
+    drawBanner(
+      ctx,
+      detections.length > 0 ? 'Click one person' : 'Waiting for a person',
+      canvasSize,
+      detections.length > 0
+        ? 'Click the target you want to follow. The other people stay out of the preview.'
+        : 'Pause on a clear frame, then click the person to lock on.',
+    );
   }
 
   if (tracking.phase === 'reacquiring' || tracking.phase === 'lost') {
