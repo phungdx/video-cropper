@@ -1,4 +1,4 @@
-import { boxCenter, iou, pointInBox, type Box, type Point } from './geometry';
+import { boxCenter, clamp, iou, pointInBox, type Box, type Point } from './geometry';
 
 export type Detection = {
   label: string;
@@ -45,17 +45,21 @@ export function matchDetectionToPrevious(
     return null;
   }
 
-  return people
+  const scored = people
     .map((d) => {
       const overlap = iou(previous, d.box);
       const center = boxCenter(d.box);
       const prevCenter = boxCenter(previous);
       const distance = Math.hypot(center.x - prevCenter.x, center.y - prevCenter.y);
-      const score = overlap * 0.75 + d.score * 0.2 + (1 / (1 + distance)) * 0.05;
+      const maxSearchDistance = Math.max(previous.width, previous.height) * 4;
+      const proximity = clamp(1 - distance / maxSearchDistance, 0, 1);
+      const score = overlap * 0.65 + proximity * 0.25 + d.score * 0.1;
+
       return { detection: d, score };
     })
-    .sort((a, b) => b.score - a.score)[0]
-    .detection;
+    .sort((a, b) => b.score - a.score);
+
+  return scored[0].score >= 0.3 ? scored[0].detection : null;
 }
 
 export function smoothBox(previous: Box, next: Box, alpha = 0.35): Box {
