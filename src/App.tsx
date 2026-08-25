@@ -9,10 +9,14 @@ import {
 } from './lib/geometry';
 import {
   choosePersonForClick,
-  matchDetectionToPrevious,
   smoothBox,
   type Detection,
 } from './lib/tracking';
+import {
+  captureAppearanceSignature,
+  selectTargetDetection,
+  type TargetProfile,
+} from './lib/reid';
 import type { ObjectDetection } from '@tensorflow-models/coco-ssd';
 
 const PREVIEW_ASPECT_RATIO = 9 / 16;
@@ -350,9 +354,11 @@ export default function App() {
   const detectorRef = useRef<ObjectDetection | null>(null);
   const detectionsRef = useRef<Detection[]>([]);
   const trackedBoxRef = useRef<Box | null>(null);
+  const targetProfileRef = useRef<TargetProfile | null>(null);
   const trackingSnapshotRef = useRef<TrackingSnapshot>(defaultTrackingSnapshot);
   const detectionInFlightRef = useRef(false);
   const lostCountRef = useRef(0);
+  const nextTargetIdRef = useRef(1);
   const videoUrlRef = useRef<string | null>(null);
 
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
@@ -415,7 +421,7 @@ export default function App() {
     const video = videoRef.current;
     const detector = detectorRef.current;
 
-    if (!video || !detector || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+    if (!video || !detector || !videoMeta || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
       return false;
     }
 
@@ -430,7 +436,10 @@ export default function App() {
       const detections = await detectPeople(detector, video);
       detectionsRef.current = detections;
 
-      if (!trackedBoxRef.current) {
+      const targetProfile = targetProfileRef.current;
+      const frameSize = videoMeta;
+
+      if (!targetProfile) {
         const nextTracking: TrackingSnapshot = {
           phase: detections.length > 0 ? 'ready' : 'idle',
           confidence: 0,
@@ -444,15 +453,28 @@ export default function App() {
         return true;
       }
 
-      const matched = matchDetectionToPrevious(detections, trackedBoxRef.current);
+      const candidateSignatures = await Promise.all(
+        detections.map((detection) => captureAppearanceSignature(video, detection.box, frameSize)),
+      );
+      const matched = selectTargetDetection(
+        detections,
+        targetProfile,
+        candidateSignatures,
+        { width: frameSize.width, height: frameSize.height },
+      );
 
       if (matched) {
-        trackedBoxRef.current = smoothBox(trackedBoxRef.current, matched.box, 0.35);
+        const nextBox = smoothBox(targetProfile.lastBox, matched.detection.box, 0.35);
+        trackedBoxRef.current = nextBox;
+        targetProfileRef.current = {
+          ...targetProfile,
+          lastBox: nextBox,
+        };
         lostCountRef.current = 0;
         setTrackingSnapshot({
           phase: 'tracking',
           confidence: matched.score,
-          message: `Tracking person (${Math.round(matched.score * 100)}%)`,
+          message: `Tracking ${targetProfile.id} (${Math.round(matched.score * 100)}%)`,
           detections: detections.length,
         });
       } else {
@@ -464,8 +486,8 @@ export default function App() {
           confidence: 0,
           message:
             phase === 'lost'
-              ? 'Lost the person. Click again to reselect.'
-              : 'Reacquiring the person…',
+              ? `Lost ${targetProfile.id}. Waiting for the same person to reappear.`
+              : `Reacquiring ${targetProfile.id}…`,
           detections: detections.length,
         });
       }
@@ -563,8 +585,10 @@ export default function App() {
     setIsPlaying(false);
     setError(null);
     trackedBoxRef.current = null;
+    targetProfileRef.current = null;
     detectionsRef.current = [];
     lostCountRef.current = 0;
+    nextTargetIdRef.current = 1;
     setTrackingSnapshot(defaultTrackingSnapshot);
   }
 
@@ -597,15 +621,7 @@ export default function App() {
         const refreshedCandidate = choosePersonForClick(detectionsRef.current, point);
 
         if (refreshedCandidate) {
-          trackedBoxRef.current = refreshedCandidate.box;
-          lostCountRef.current = 0;
-          setTrackingSnapshot({
-            phase: 'tracking',
-            confidence: refreshedCandidate.score,
-            message: 'Tracking selected person.',
-            detections: detectionsRef.current.length,
-          });
-          setError(null);
+          activateTarget(refreshedCandidate);
         } else {
           setTrackingSnapshot({
             phase: 'idle',
@@ -618,12 +634,31 @@ export default function App() {
       return;
     }
 
+    activateTarget(candidate);
+  }
+
+  function activateTarget(candidate: Detection) {
+    const video = videoRef.current;
+
+    if (!videoMeta || !video) {
+      return;
+    }
+
+    const targetId = `person-${nextTargetIdRef.current}`;
+    nextTargetIdRef.current += 1;
+    const signature = captureAppearanceSignature(video, candidate.box, videoMeta);
+
+    targetProfileRef.current = {
+      id: targetId,
+      lastBox: candidate.box,
+      signature,
+    };
     trackedBoxRef.current = candidate.box;
     lostCountRef.current = 0;
     setTrackingSnapshot({
       phase: 'tracking',
       confidence: candidate.score,
-      message: 'Tracking selected person.',
+      message: `Tracking ${targetId}.`,
       detections: detectionsRef.current.length,
     });
     setError(null);
