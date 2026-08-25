@@ -304,10 +304,17 @@ function drawPreviewFrame(
   ctx.save();
   ctx.fillStyle = 'rgba(0, 0, 0, 0.86)';
   ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
-  ctx.globalCompositeOperation = 'destination-out';
-  drawRoundedRect(ctx, focusRect.x, focusRect.y, focusRect.width, focusRect.height, 18);
-  ctx.fill();
-  ctx.globalCompositeOperation = 'source-over';
+  ctx.drawImage(
+    video,
+    focusBox.x,
+    focusBox.y,
+    focusBox.width,
+    focusBox.height,
+    focusRect.x,
+    focusRect.y,
+    focusRect.width,
+    focusRect.height,
+  );
   ctx.strokeStyle = 'rgba(97, 240, 210, 0.9)';
   ctx.lineWidth = Math.max(1.5, canvasSize.width / 420);
   drawRoundedRect(ctx, focusRect.x, focusRect.y, focusRect.width, focusRect.height, 18);
