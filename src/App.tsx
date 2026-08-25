@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
-import { computeCropRect, type Box, type FrameSize, type Point } from './lib/geometry';
+import {
+  computeCropRect,
+  expandBox,
+  projectBoxToRect,
+  type Box,
+  type FrameSize,
+  type Point,
+} from './lib/geometry';
 import {
   choosePersonForClick,
   matchDetectionToPrevious,
@@ -291,18 +298,26 @@ function drawPreviewFrame(
   const crop = computeCropRect(trackedBox, { width: videoMeta.width, height: videoMeta.height }, PREVIEW_ASPECT_RATIO);
   ctx.drawImage(video, crop.x, crop.y, crop.width, crop.height, 0, 0, canvasSize.width, canvasSize.height);
 
+  const focusBox = expandBox(trackedBox, 0.12, { width: videoMeta.width, height: videoMeta.height });
+  const focusRect = projectBoxToRect(focusBox, crop, canvasSize);
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.86)';
+  ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
+  ctx.globalCompositeOperation = 'destination-out';
+  drawRoundedRect(ctx, focusRect.x, focusRect.y, focusRect.width, focusRect.height, 18);
+  ctx.fill();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.strokeStyle = 'rgba(97, 240, 210, 0.9)';
+  ctx.lineWidth = Math.max(1.5, canvasSize.width / 420);
+  drawRoundedRect(ctx, focusRect.x, focusRect.y, focusRect.width, focusRect.height, 18);
+  ctx.stroke();
+  ctx.restore();
+
   ctx.save();
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
   ctx.lineWidth = Math.max(2, canvasSize.width / 280);
   ctx.strokeRect(12, 12, canvasSize.width - 24, canvasSize.height - 24);
-  ctx.strokeStyle = 'rgba(97, 240, 210, 0.85)';
-  ctx.lineWidth = Math.max(1.5, canvasSize.width / 420);
-  ctx.beginPath();
-  ctx.moveTo(canvasSize.width / 2, canvasSize.height * 0.5 - 22);
-  ctx.lineTo(canvasSize.width / 2, canvasSize.height * 0.5 + 22);
-  ctx.moveTo(canvasSize.width / 2 - 22, canvasSize.height * 0.5);
-  ctx.lineTo(canvasSize.width / 2 + 22, canvasSize.height * 0.5);
-  ctx.stroke();
   ctx.restore();
 }
 

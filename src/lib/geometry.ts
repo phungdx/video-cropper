@@ -49,6 +49,31 @@ export function iou(a: Box, b: Box): number {
   return unionArea <= 0 ? 0 : intersectionArea / unionArea;
 }
 
+export function expandBox(box: Box, paddingRatio: number, bounds: FrameSize): Box {
+  const padX = box.width * paddingRatio;
+  const padY = box.height * paddingRatio;
+  const left = clamp(box.x - padX, 0, bounds.width);
+  const top = clamp(box.y - padY, 0, bounds.height);
+  const right = clamp(box.x + box.width + padX, left, bounds.width);
+  const bottom = clamp(box.y + box.height + padY, top, bounds.height);
+
+  return {
+    x: left,
+    y: top,
+    width: Math.max(0, right - left),
+    height: Math.max(0, bottom - top),
+  };
+}
+
+export function projectBoxToRect(box: Box, source: Box, target: FrameSize): Box {
+  return {
+    x: ((box.x - source.x) / source.width) * target.width,
+    y: ((box.y - source.y) / source.height) * target.height,
+    width: (box.width / source.width) * target.width,
+    height: (box.height / source.height) * target.height,
+  };
+}
+
 export function computeCropRect(
   box: Box,
   frame: FrameSize,
