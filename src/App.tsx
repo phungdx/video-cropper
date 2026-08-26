@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  boxAspectRatio,
   clamp,
   computeCropRect,
-  expandBox,
   pointInBox,
-  projectBoxToRect,
+  DEFAULT_CROP_ASPECT_RATIO,
   type Box,
   type FrameSize,
   type Point,
@@ -35,7 +35,6 @@ import {
 } from './lib/tracker';
 import type { ObjectDetection } from '@tensorflow-models/coco-ssd';
 
-const PREVIEW_ASPECT_RATIO = 9 / 16;
 /** How far ahead of the last detection the box is allowed to coast on screen, in seconds. */
 const MAX_RENDER_EXTRAPOLATION = 0.25;
 /** Per-frame easing applied to the on-screen box so it glides instead of stepping. */
@@ -387,12 +386,17 @@ function drawSourceOverlay(
   }
 }
 
+/**
+ * Paints exactly what an export would record: the subject's bounding box, full bleed. No dimming
+ * or highlight, because the crop is the box now, so there is no surrounding context to play down.
+ */
 function drawPreviewFrame(
   ctx: CanvasRenderingContext2D,
   canvasSize: CanvasSize,
   video: HTMLVideoElement | null,
   videoMeta: VideoMeta | null,
   trackedBox: Box | null,
+  aspectRatio: number,
 ) {
   ctx.clearRect(0, 0, canvasSize.width, canvasSize.height);
 
@@ -401,37 +405,13 @@ function drawPreviewFrame(
     return;
   }
 
-  const crop = computeCropRect(trackedBox, { width: videoMeta.width, height: videoMeta.height }, PREVIEW_ASPECT_RATIO);
-  ctx.drawImage(video, crop.x, crop.y, crop.width, crop.height, 0, 0, canvasSize.width, canvasSize.height);
-
-  const focusBox = expandBox(trackedBox, 0.12, { width: videoMeta.width, height: videoMeta.height });
-  const focusRect = projectBoxToRect(focusBox, crop, canvasSize);
-
-  ctx.save();
-  ctx.fillStyle = 'rgba(20, 20, 19, 0.86)';
-  ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
-  ctx.drawImage(
-    video,
-    focusBox.x,
-    focusBox.y,
-    focusBox.width,
-    focusBox.height,
-    focusRect.x,
-    focusRect.y,
-    focusRect.width,
-    focusRect.height,
+  const crop = computeCropRect(
+    trackedBox,
+    { width: videoMeta.width, height: videoMeta.height },
+    aspectRatio,
   );
-  ctx.strokeStyle = 'rgba(120, 140, 93, 0.92)';
-  ctx.lineWidth = Math.max(1.5, canvasSize.width / 420);
-  drawRoundedRect(ctx, focusRect.x, focusRect.y, focusRect.width, focusRect.height, 12);
-  ctx.stroke();
-  ctx.restore();
 
-  ctx.save();
-  ctx.strokeStyle = 'rgba(250, 249, 245, 0.24)';
-  ctx.lineWidth = Math.max(2, canvasSize.width / 280);
-  ctx.strokeRect(12, 12, canvasSize.width - 24, canvasSize.height - 24);
-  ctx.restore();
+  ctx.drawImage(video, crop.x, crop.y, crop.width, crop.height, 0, 0, canvasSize.width, canvasSize.height);
 }
 
 /** Resolves once the video has actually landed on the requested timestamp. */
@@ -475,6 +455,10 @@ export default function App() {
   const detectionsRef = useRef<Detection[]>([]);
   const trackRef = useRef<TargetTrack | null>(null);
   const renderBoxRef = useRef<Box | null>(null);
+  // Locked in when the subject is picked. The crop shape has to hold still for the whole clip:
+  // the recorder cannot resize its canvas mid-take, and a shape that breathed with every
+  // detection would make the subject pulse.
+  const cropAspectRef = useRef(DEFAULT_CROP_ASPECT_RATIO);
   const lastTrackTimeRef = useRef(0);
   const detectionInFlightRef = useRef(false);
   const nextTargetIdRef = useRef(1);
@@ -492,6 +476,7 @@ export default function App() {
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
   const [videoMeta, setVideoMeta] = useState<VideoMeta | null>(null);
+  const [cropAspect, setCropAspect] = useState(DEFAULT_CROP_ASPECT_RATIO);
   const [modelPhase, setModelPhase] = useState<ModelPhase>('idle');
   const [trackingSnapshot, setTrackingSnapshot] = useState<TrackingSnapshot>(defaultTrackingSnapshot);
   const [currentTime, setCurrentTime] = useState(0);
@@ -665,7 +650,14 @@ export default function App() {
         resizeCanvas(previewCanvas, previewStage.size);
         const ctx = previewCanvas.getContext('2d');
         if (ctx) {
-          drawPreviewFrame(ctx, previewStage.size, video, videoMeta, renderBoxRef.current);
+          drawPreviewFrame(
+            ctx,
+            previewStage.size,
+            video,
+            videoMeta,
+            renderBoxRef.current,
+            cropAspectRef.current,
+          );
         }
       }
 
@@ -681,7 +673,7 @@ export default function App() {
             frame,
             renderBoxRef.current,
             exportCropRef.current,
-            PREVIEW_ASPECT_RATIO,
+            cropAspectRef.current,
             { width: exportCanvas.width, height: exportCanvas.height },
           );
         }
@@ -767,6 +759,8 @@ export default function App() {
     detectionsRef.current = [];
     lastTrackTimeRef.current = 0;
     nextTargetIdRef.current = 1;
+    cropAspectRef.current = DEFAULT_CROP_ASPECT_RATIO;
+    setCropAspect(DEFAULT_CROP_ASPECT_RATIO);
     setTrackingSnapshot(defaultTrackingSnapshot);
   }
 
@@ -830,7 +824,10 @@ export default function App() {
     const frame: FrameSize = { width: videoMeta.width, height: videoMeta.height };
     const signature = captureAppearanceSignature(video, candidate.box, frame);
     const track = createTrack(targetId, candidate, signature);
+    const aspectRatio = boxAspectRatio(candidate.box);
 
+    cropAspectRef.current = aspectRatio;
+    setCropAspect(aspectRatio);
     trackRef.current = track;
     renderBoxRef.current = candidate.box;
     lastTrackTimeRef.current = video.currentTime;
@@ -962,21 +959,25 @@ export default function App() {
     setError(null);
     setExportPhase('recording');
 
-    const size = resolveExportSize(
-      { width: videoMeta.width, height: videoMeta.height },
-      PREVIEW_ASPECT_RATIO,
+    video.pause();
+    setIsPlaying(false);
+    await seekVideo(video, 0);
+    // Detect once before the tape rolls so the very first frames are already framed, and so the
+    // canvas is sized from where the subject actually is at the start of the clip.
+    await runDetection();
+
+    const frame: FrameSize = { width: videoMeta.width, height: videoMeta.height };
+    const openingCrop = computeCropRect(
+      trackRef.current?.box ?? track.box,
+      frame,
+      cropAspectRef.current,
     );
+    const size = resolveExportSize(openingCrop, cropAspectRef.current);
     const canvas = exportCanvasRef.current ?? document.createElement('canvas');
     canvas.width = size.width;
     canvas.height = size.height;
     exportCanvasRef.current = canvas;
     exportCropRef.current = null;
-
-    video.pause();
-    setIsPlaying(false);
-    await seekVideo(video, 0);
-    // Detect once before the tape rolls so the very first frames are already framed.
-    await runDetection();
 
     try {
       const stream = canvas.captureStream(EXPORT_FRAME_RATE);
@@ -1049,6 +1050,8 @@ export default function App() {
   function clearSelection() {
     trackRef.current = null;
     renderBoxRef.current = null;
+    cropAspectRef.current = DEFAULT_CROP_ASPECT_RATIO;
+    setCropAspect(DEFAULT_CROP_ASPECT_RATIO);
     const detections = detectionsRef.current;
 
     setTrackingSnapshot({
@@ -1248,7 +1251,7 @@ export default function App() {
               </div>
             </div>
 
-            <div className="preview-stage" ref={previewStage.ref} style={{ aspectRatio: `${9 / 16}` }}>
+            <div className="preview-stage" ref={previewStage.ref} style={{ aspectRatio: `${cropAspect}` }}>
               <canvas ref={previewCanvasRef} className="preview-canvas" />
             </div>
 
@@ -1312,7 +1315,7 @@ export default function App() {
                     {exportResult
                       ? `${exportResult.fileName} is ready to save.`
                       : canExport
-                        ? 'Replays the clip once from the start and records the 9:16 crop with its audio.'
+                        ? 'Replays the clip once from the start and records the crop with its audio.'
                         : 'Pick a person first, then the cropped video can be exported.'}
                   </p>
                 </>

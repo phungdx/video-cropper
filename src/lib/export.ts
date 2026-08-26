@@ -1,9 +1,11 @@
-import { computeCropRect, type Box, type FrameSize } from './geometry';
+import { centerCropRect, clamp, computeCropRect, type Box, type FrameSize } from './geometry';
 
 /** Frames per second requested from the canvas capture stream. */
 export const EXPORT_FRAME_RATE = 30;
 /** Tall side cap so a 4K source does not produce an unusable export. */
 export const MAX_EXPORT_HEIGHT = 1920;
+/** Tall side floor, so a crop taken from a distant subject still yields a watchable file. */
+export const MIN_EXPORT_HEIGHT = 640;
 
 export type RecordingFormat = {
   mimeType: string;
@@ -34,15 +36,17 @@ function toEvenSize(value: number): number {
 }
 
 /**
- * Picks the output resolution for the cropped video: as tall as the source allows, capped, with
- * the width derived from the target aspect ratio.
+ * Picks the output resolution from the crop itself rather than the source frame, so a tight crop
+ * is written close to its native pixels instead of being blown up to full frame height.
  */
 export function resolveExportSize(
-  frame: FrameSize,
+  crop: FrameSize,
   aspectRatio: number,
   maxHeight = MAX_EXPORT_HEIGHT,
 ): FrameSize {
-  const height = toEvenSize(Math.min(Math.max(frame.height, 2), maxHeight));
+  const height = toEvenSize(
+    clamp(crop.height, Math.min(MIN_EXPORT_HEIGHT, maxHeight), maxHeight),
+  );
 
   return {
     width: toEvenSize(height * aspectRatio),
@@ -93,12 +97,7 @@ export function drawExportFrame(
   const crop =
     box !== null
       ? computeCropRect(box, frame, aspectRatio)
-      : fallbackCrop ?? computeCropRect(
-          { x: 0, y: 0, width: frame.width, height: frame.height },
-          frame,
-          aspectRatio,
-          0,
-        );
+      : fallbackCrop ?? centerCropRect(frame, aspectRatio);
 
   ctx.drawImage(
     source,

@@ -74,18 +74,42 @@ export function projectBoxToRect(box: Box, source: Box, target: FrameSize): Box 
   };
 }
 
-export function computeCropRect(
-  box: Box,
+/**
+ * Slack added around the detected box. Detector boxes sit tight against the body and wobble a few
+ * pixels between passes, so a little margin stops hair and hands from being shaved off.
+ */
+export const CROP_MARGIN = 0.04;
+/** Guard rails on the derived aspect ratio, so one bad detection cannot pick a freak shape. */
+export const MIN_CROP_ASPECT_RATIO = 0.2;
+export const MAX_CROP_ASPECT_RATIO = 3;
+/** Used before a person is selected, and if a box is too degenerate to measure. */
+export const DEFAULT_CROP_ASPECT_RATIO = 9 / 16;
+
+/**
+ * The shape of the subject's own bounding box, which becomes the output shape so that cropping to
+ * the box does not need to add margin on either axis.
+ */
+export function boxAspectRatio(box: Box, fallback = DEFAULT_CROP_ASPECT_RATIO): number {
+  if (!Number.isFinite(box.width) || !Number.isFinite(box.height) || box.width <= 0 || box.height <= 0) {
+    return fallback;
+  }
+
+  return clamp(box.width / box.height, MIN_CROP_ASPECT_RATIO, MAX_CROP_ASPECT_RATIO);
+}
+
+/**
+ * Grows the requested size to the target aspect ratio around a fixed center, shrinks it if it no
+ * longer fits, then slides it inside the frame.
+ */
+function fitRectToFrame(
+  center: Point,
+  width: number,
+  height: number,
   frame: FrameSize,
   aspectRatio: number,
-  padding = 0.45,
 ): Box {
-  const center = boxCenter(box);
-  const paddedWidth = box.width * (1 + padding * 2);
-  const paddedHeight = box.height * (1 + padding * 2);
-
-  let cropWidth = paddedWidth;
-  let cropHeight = paddedHeight;
+  let cropWidth = width;
+  let cropHeight = height;
 
   if (cropWidth / cropHeight < aspectRatio) {
     cropWidth = cropHeight * aspectRatio;
@@ -106,16 +130,43 @@ export function computeCropRect(
   cropWidth = Math.min(cropWidth, frame.width);
   cropHeight = Math.min(cropHeight, frame.height);
 
-  let x = center.x - cropWidth / 2;
-  let y = center.y - cropHeight / 2;
-
-  x = clamp(x, 0, Math.max(0, frame.width - cropWidth));
-  y = clamp(y, 0, Math.max(0, frame.height - cropHeight));
-
   return {
-    x,
-    y,
+    x: clamp(center.x - cropWidth / 2, 0, Math.max(0, frame.width - cropWidth)),
+    y: clamp(center.y - cropHeight / 2, 0, Math.max(0, frame.height - cropHeight)),
     width: cropWidth,
     height: cropHeight,
   };
+}
+
+/** The neutral framing used before a person is picked: a centered slice of the whole frame. */
+export function centerCropRect(frame: FrameSize, aspectRatio: number): Box {
+  return fitRectToFrame(
+    { x: frame.width / 2, y: frame.height / 2 },
+    frame.width,
+    frame.height,
+    frame,
+    aspectRatio,
+  );
+}
+
+/**
+ * Crops to the subject's bounding box: the box plus a small margin, grown on one axis only if the
+ * output shape demands it. When the aspect ratio came from the same subject, as it does for an
+ * export, that growth is negligible and the crop is the bounding box.
+ */
+export function computeCropRect(
+  box: Box,
+  frame: FrameSize,
+  aspectRatio: number,
+  margin = CROP_MARGIN,
+): Box {
+  const grow = 1 + Math.max(0, margin) * 2;
+
+  return fitRectToFrame(
+    boxCenter(box),
+    box.width * grow,
+    box.height * grow,
+    frame,
+    aspectRatio,
+  );
 }
