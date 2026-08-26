@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  clamp,
   computeCropRect,
   expandBox,
+  pointInBox,
   projectBoxToRect,
   type Box,
   type FrameSize,
@@ -12,25 +14,69 @@ import {
   smoothBox,
   type Detection,
 } from './lib/tracking';
+import { captureAppearanceSignature } from './lib/reid';
 import {
-  captureAppearanceSignature,
-  selectTargetDetection,
-  type TargetProfile,
-} from './lib/reid';
+  buildDownloadFileName,
+  drawExportFrame,
+  exportProgress,
+  formatFileSize,
+  pickRecordingFormat,
+  resolveExportSize,
+  EXPORT_FRAME_RATE,
+} from './lib/export';
+import {
+  advanceTrack,
+  associateTarget,
+  createTrack,
+  predictBox,
+  LOST_AFTER_MISSES,
+  type TargetTrack,
+  type TrackCandidate,
+} from './lib/tracker';
 import type { ObjectDetection } from '@tensorflow-models/coco-ssd';
 
 const PREVIEW_ASPECT_RATIO = 9 / 16;
-const DETECTION_INTERVAL_MS = 260;
-const LOST_THRESHOLD = 3;
+/** How far ahead of the last detection the box is allowed to coast on screen, in seconds. */
+const MAX_RENDER_EXTRAPOLATION = 0.25;
+/** Per-frame easing applied to the on-screen box so it glides instead of stepping. */
+const RENDER_SMOOTHING = 0.35;
+
+/**
+ * Canvas overlays are drawn imperatively, so the brand palette is mirrored here to stay in
+ * step with the CSS custom properties in styles.css.
+ */
+const PALETTE = {
+  ink: '#141413',
+  light: '#faf9f5',
+  coral: '#d97757',
+  blue: '#6a9bcc',
+  green: '#788c5d',
+  brick: '#93382a',
+  displayFont: 'Lora, ui-serif, Georgia, serif',
+  uiFont: 'Poppins, ui-sans-serif, system-ui, sans-serif',
+} as const;
 
 type ModelPhase = 'idle' | 'loading' | 'ready' | 'error';
-type TrackingPhase = 'idle' | 'ready' | 'tracking' | 'reacquiring' | 'lost';
+type TrackingPhase = 'idle' | 'ready' | 'tracking' | 'coasting' | 'lost';
+type ExportPhase = 'idle' | 'recording' | 'finishing' | 'ready';
+
+type ExportResult = {
+  url: string;
+  fileName: string;
+  size: number;
+};
+
+type AudioTap = {
+  source: MediaElementAudioSourceNode;
+  destination: MediaStreamAudioDestinationNode;
+};
 
 type TrackingSnapshot = {
   phase: TrackingPhase;
   confidence: number;
   message: string;
   detections: number;
+  targetId: string | null;
 };
 
 type VideoMeta = {
@@ -49,7 +95,38 @@ const defaultTrackingSnapshot: TrackingSnapshot = {
   confidence: 0,
   message: 'Upload a video to begin.',
   detections: 0,
+  targetId: null,
 };
+
+function describeTrack(track: TargetTrack, detections: number): TrackingSnapshot {
+  if (track.status === 'tracking') {
+    return {
+      phase: 'tracking',
+      confidence: track.confidence,
+      message: `Locked on ${track.id}. The box follows them until the video ends.`,
+      detections,
+      targetId: track.id,
+    };
+  }
+
+  if (track.status === 'coasting') {
+    return {
+      phase: 'coasting',
+      confidence: track.confidence,
+      message: `${track.id} is hidden. Holding their path and waiting for them to reappear.`,
+      detections,
+      targetId: track.id,
+    };
+  }
+
+  return {
+    phase: 'lost',
+    confidence: 0,
+    message: `Searching the whole frame for ${track.id}. The crop stays put until they return.`,
+    detections,
+    targetId: track.id,
+  };
+}
 
 function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) {
@@ -137,66 +214,85 @@ function drawBanner(
   const centerY = canvasSize.height / 2;
 
   ctx.save();
-  ctx.fillStyle = 'rgba(7, 10, 20, 0.76)';
-  drawRoundedRect(ctx, centerX - 220, centerY - 60, 440, 120, 24);
+  ctx.fillStyle = 'rgba(250, 249, 245, 0.94)';
+  drawRoundedRect(ctx, centerX - 230, centerY - 62, 460, 124, 14);
   ctx.fill();
 
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
-  ctx.lineWidth = Math.max(1.5, canvasSize.width / 320);
+  ctx.strokeStyle = 'rgba(20, 20, 19, 0.12)';
+  ctx.lineWidth = Math.max(1, canvasSize.width / 640);
   ctx.stroke();
 
-  ctx.fillStyle = '#eef4ff';
-  ctx.font = '700 26px Inter, system-ui, sans-serif';
+  ctx.fillStyle = PALETTE.ink;
+  ctx.font = `500 27px ${PALETTE.displayFont}`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(message, centerX, centerY - 8);
+  ctx.fillText(message, centerX, centerY - 10);
 
   if (subtitle) {
-    ctx.fillStyle = 'rgba(238, 244, 255, 0.72)';
-    ctx.font = '500 16px Inter, system-ui, sans-serif';
+    ctx.fillStyle = 'rgba(20, 20, 19, 0.6)';
+    ctx.font = `400 15px ${PALETTE.uiFont}`;
     ctx.fillText(subtitle, centerX, centerY + 24);
   }
 
   ctx.restore();
 }
 
-function drawDetectionBox(
+function drawBoxWithLabel(
   ctx: CanvasRenderingContext2D,
-  detection: Detection,
+  box: Box,
+  label: string,
   scaleX: number,
   scaleY: number,
-  highlight: boolean,
+  borderColor: string,
+  fillColor: string,
+  lineWidth: number,
 ) {
-  const { box, score } = detection;
   const x = box.x * scaleX;
   const y = box.y * scaleY;
   const width = box.width * scaleX;
   const height = box.height * scaleY;
-  const borderColor = highlight ? '#61f0d2' : 'rgba(140, 176, 255, 0.88)';
 
   ctx.save();
-  ctx.lineWidth = highlight ? 4 : 2.5;
+  ctx.lineWidth = lineWidth;
   ctx.strokeStyle = borderColor;
-  ctx.fillStyle = highlight ? 'rgba(97, 240, 210, 0.16)' : 'rgba(140, 176, 255, 0.08)';
-  drawRoundedRect(ctx, x, y, width, height, 16);
+  ctx.fillStyle = fillColor;
+  drawRoundedRect(ctx, x, y, width, height, 10);
   ctx.fill();
   ctx.stroke();
 
-  const label = `${detection.label} ${Math.round(score * 100)}%`;
-  ctx.font = '700 15px Inter, system-ui, sans-serif';
-  const labelWidth = ctx.measureText(label).width + 20;
-  const labelHeight = 30;
-  const labelX = x;
-  const labelY = Math.max(8, y - labelHeight - 10);
+  ctx.font = `500 15px ${PALETTE.uiFont}`;
+  ctx.textAlign = 'left';
+  const labelWidth = ctx.measureText(label).width + 22;
+  const labelHeight = 28;
+  const labelY = Math.max(6, y - labelHeight - 8);
 
   ctx.fillStyle = borderColor;
-  drawRoundedRect(ctx, labelX, labelY, labelWidth, labelHeight, 12);
+  drawRoundedRect(ctx, x, labelY, labelWidth, labelHeight, 6);
   ctx.fill();
 
-  ctx.fillStyle = '#07111c';
+  ctx.fillStyle = PALETTE.light;
   ctx.textBaseline = 'middle';
-  ctx.fillText(label, labelX + 10, labelY + labelHeight / 2);
+  ctx.fillText(label, x + 11, labelY + labelHeight / 2 + 1);
   ctx.restore();
+}
+
+function drawCandidateBox(
+  ctx: CanvasRenderingContext2D,
+  detection: Detection,
+  index: number,
+  scaleX: number,
+  scaleY: number,
+) {
+  drawBoxWithLabel(
+    ctx,
+    detection.box,
+    `${index + 1} · ${Math.round(detection.score * 100)}%`,
+    scaleX,
+    scaleY,
+    'rgba(106, 155, 204, 0.92)',
+    'rgba(106, 155, 204, 0.1)',
+    2,
+  );
 }
 
 function drawSourceOverlay(
@@ -204,8 +300,8 @@ function drawSourceOverlay(
   canvasSize: CanvasSize,
   videoMeta: VideoMeta | null,
   detections: Detection[],
+  track: TargetTrack | null,
   trackedBox: Box | null,
-  tracking: TrackingSnapshot,
 ) {
   ctx.clearRect(0, 0, canvasSize.width, canvasSize.height);
 
@@ -218,38 +314,68 @@ function drawSourceOverlay(
   const scaleX = canvasSize.width / frame.width;
   const scaleY = canvasSize.height / frame.height;
 
-  if (trackedBox) {
-    const selectedDetection = detections.reduce<Detection | null>((best, detection) => {
-      if (!best) {
-        return detection;
-      }
+  if (!track || !trackedBox) {
+    detections.forEach((detection, index) => {
+      drawCandidateBox(ctx, detection, index, scaleX, scaleY);
+    });
 
-      const bestScore = Math.abs(best.box.x - trackedBox.x) + Math.abs(best.box.y - trackedBox.y);
-      const candidateScore =
-        Math.abs(detection.box.x - trackedBox.x) + Math.abs(detection.box.y - trackedBox.y);
+    drawBanner(
+      ctx,
+      detections.length > 0 ? 'Click the person to follow' : 'Waiting for a person',
+      canvasSize,
+      detections.length > 0
+        ? 'Whoever you click stays in the crop for the rest of the video.'
+        : 'Pause on a clear frame, then click the person to lock on.',
+    );
+    return;
+  }
 
-      return candidateScore < bestScore ? detection : best;
-    }, null);
+  const trackedCenter = {
+    x: trackedBox.x + trackedBox.width / 2,
+    y: trackedBox.y + trackedBox.height / 2,
+  };
 
-    if (selectedDetection) {
-      drawDetectionBox(ctx, selectedDetection, scaleX, scaleY, true);
-    } else {
-      drawDetectionBox(
-        ctx,
-        {
-          label: 'person',
-          score: 1,
-          box: trackedBox,
-        },
-        scaleX,
-        scaleY,
-        true,
-      );
+  detections.forEach((detection, index) => {
+    const center = {
+      x: detection.box.x + detection.box.width / 2,
+      y: detection.box.y + detection.box.height / 2,
+    };
+    const isTarget =
+      Math.hypot(center.x - trackedCenter.x, center.y - trackedCenter.y) <
+      Math.max(trackedBox.width, trackedBox.height) * 0.4;
+
+    if (!isTarget) {
+      drawCandidateBox(ctx, detection, index, scaleX, scaleY);
     }
+  });
 
+  const locked = track.status === 'tracking';
+  const borderColor = locked
+    ? PALETTE.green
+    : track.status === 'coasting'
+      ? PALETTE.coral
+      : PALETTE.brick;
+  const label = locked
+    ? `${track.id} · ${Math.round(track.confidence * 100)}%`
+    : track.status === 'coasting'
+      ? `${track.id} · hidden`
+      : `${track.id} · searching`;
+
+  drawBoxWithLabel(
+    ctx,
+    trackedBox,
+    label,
+    scaleX,
+    scaleY,
+    borderColor,
+    locked ? 'rgba(120, 140, 93, 0.18)' : 'rgba(217, 119, 87, 0.14)',
+    3.5,
+  );
+
+  if (!locked) {
     ctx.save();
-    ctx.strokeStyle = '#61f0d2';
-    ctx.lineWidth = 5;
+    ctx.strokeStyle = borderColor;
+    ctx.lineWidth = 2.5;
     ctx.setLineDash([10, 8]);
     ctx.strokeRect(
       trackedBox.x * scaleX,
@@ -257,30 +383,6 @@ function drawSourceOverlay(
       trackedBox.width * scaleX,
       trackedBox.height * scaleY,
     );
-    ctx.restore();
-  } else {
-    drawBanner(
-      ctx,
-      detections.length > 0 ? 'Click one person' : 'Waiting for a person',
-      canvasSize,
-      detections.length > 0
-        ? 'Click the target you want to follow. The other people stay out of the preview.'
-        : 'Pause on a clear frame, then click the person to lock on.',
-    );
-  }
-
-  if (tracking.phase === 'reacquiring' || tracking.phase === 'lost') {
-    ctx.save();
-    ctx.fillStyle = tracking.phase === 'lost' ? 'rgba(255, 103, 103, 0.14)' : 'rgba(255, 196, 87, 0.14)';
-    drawRoundedRect(ctx, 24, 24, 220, 48, 18);
-    ctx.fill();
-    ctx.strokeStyle = tracking.phase === 'lost' ? '#ff7979' : '#ffc457';
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    ctx.fillStyle = '#eef4ff';
-    ctx.font = '700 16px Inter, system-ui, sans-serif';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(tracking.phase === 'lost' ? 'Target lost' : 'Reacquiring', 44, 48);
     ctx.restore();
   }
 }
@@ -306,7 +408,7 @@ function drawPreviewFrame(
   const focusRect = projectBoxToRect(focusBox, crop, canvasSize);
 
   ctx.save();
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.86)';
+  ctx.fillStyle = 'rgba(20, 20, 19, 0.86)';
   ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
   ctx.drawImage(
     video,
@@ -319,17 +421,35 @@ function drawPreviewFrame(
     focusRect.width,
     focusRect.height,
   );
-  ctx.strokeStyle = 'rgba(97, 240, 210, 0.9)';
+  ctx.strokeStyle = 'rgba(120, 140, 93, 0.92)';
   ctx.lineWidth = Math.max(1.5, canvasSize.width / 420);
-  drawRoundedRect(ctx, focusRect.x, focusRect.y, focusRect.width, focusRect.height, 18);
+  drawRoundedRect(ctx, focusRect.x, focusRect.y, focusRect.width, focusRect.height, 12);
   ctx.stroke();
   ctx.restore();
 
   ctx.save();
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
+  ctx.strokeStyle = 'rgba(250, 249, 245, 0.24)';
   ctx.lineWidth = Math.max(2, canvasSize.width / 280);
   ctx.strokeRect(12, 12, canvasSize.width - 24, canvasSize.height - 24);
   ctx.restore();
+}
+
+/** Resolves once the video has actually landed on the requested timestamp. */
+function seekVideo(video: HTMLVideoElement, time: number): Promise<void> {
+  return new Promise((resolve) => {
+    if (Math.abs(video.currentTime - time) < 0.05) {
+      resolve();
+      return;
+    }
+
+    const handleSettled = () => {
+      video.removeEventListener('seeked', handleSettled);
+      resolve();
+    };
+
+    video.addEventListener('seeked', handleSettled);
+    video.currentTime = time;
+  });
 }
 
 function getVideoPointFromClick(
@@ -353,13 +473,21 @@ export default function App() {
   const previewStage = useObservedCanvasSize<HTMLDivElement>();
   const detectorRef = useRef<ObjectDetection | null>(null);
   const detectionsRef = useRef<Detection[]>([]);
-  const trackedBoxRef = useRef<Box | null>(null);
-  const targetProfileRef = useRef<TargetProfile | null>(null);
-  const trackingSnapshotRef = useRef<TrackingSnapshot>(defaultTrackingSnapshot);
+  const trackRef = useRef<TargetTrack | null>(null);
+  const renderBoxRef = useRef<Box | null>(null);
+  const lastTrackTimeRef = useRef(0);
   const detectionInFlightRef = useRef(false);
-  const lostCountRef = useRef(0);
   const nextTargetIdRef = useRef(1);
   const videoUrlRef = useRef<string | null>(null);
+  const exportCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const exportCropRef = useRef<Box | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recordingRef = useRef(false);
+  const chunksRef = useRef<Blob[]>([]);
+  const discardExportRef = useRef(false);
+  const exportUrlRef = useRef<string | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioTapRef = useRef<AudioTap | null>(null);
 
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
@@ -369,16 +497,25 @@ export default function App() {
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    trackingSnapshotRef.current = trackingSnapshot;
-  }, [trackingSnapshot]);
+  const [exportPhase, setExportPhase] = useState<ExportPhase>('idle');
+  const [exportedFraction, setExportedFraction] = useState(0);
+  const [exportResult, setExportResult] = useState<ExportResult | null>(null);
 
   useEffect(() => {
     return () => {
       if (videoUrlRef.current) {
         URL.revokeObjectURL(videoUrlRef.current);
       }
+
+      if (exportUrlRef.current) {
+        URL.revokeObjectURL(exportUrlRef.current);
+      }
+
+      if (recorderRef.current && recorderRef.current.state !== 'inactive') {
+        recorderRef.current.stop();
+      }
+
+      void audioContextRef.current?.close().catch(() => undefined);
     };
   }, []);
 
@@ -436,11 +573,11 @@ export default function App() {
       const detections = await detectPeople(detector, video);
       detectionsRef.current = detections;
 
-      const targetProfile = targetProfileRef.current;
-      const frameSize = videoMeta;
+      const frame: FrameSize = { width: videoMeta.width, height: videoMeta.height };
+      const track = trackRef.current;
 
-      if (!targetProfile) {
-        const nextTracking: TrackingSnapshot = {
+      if (!track) {
+        setTrackingSnapshot({
           phase: detections.length > 0 ? 'ready' : 'idle',
           confidence: 0,
           message:
@@ -448,49 +585,24 @@ export default function App() {
               ? 'Click a person in the frame to lock on.'
               : 'No person detected yet. Try a clearer frame.',
           detections: detections.length,
-        };
-        setTrackingSnapshot(nextTracking);
+          targetId: null,
+        });
         return true;
       }
 
-      const candidateSignatures = await Promise.all(
-        detections.map((detection) => captureAppearanceSignature(video, detection.box, frameSize)),
-      );
-      const matched = selectTargetDetection(
-        detections,
-        targetProfile,
-        candidateSignatures,
-        { width: frameSize.width, height: frameSize.height },
-      );
+      const candidates: TrackCandidate[] = detections.map((detection) => ({
+        detection,
+        signature: captureAppearanceSignature(video, detection.box, frame),
+      }));
 
-      if (matched) {
-        const nextBox = smoothBox(targetProfile.lastBox, matched.detection.box, 0.35);
-        trackedBoxRef.current = nextBox;
-        targetProfileRef.current = {
-          ...targetProfile,
-          lastBox: nextBox,
-        };
-        lostCountRef.current = 0;
-        setTrackingSnapshot({
-          phase: 'tracking',
-          confidence: matched.score,
-          message: `Tracking ${targetProfile.id} (${Math.round(matched.score * 100)}%)`,
-          detections: detections.length,
-        });
-      } else {
-        lostCountRef.current += 1;
-        const phase = lostCountRef.current >= LOST_THRESHOLD ? 'lost' : 'reacquiring';
+      // Playback time, not wall-clock time, so pausing or scrubbing cannot fake motion.
+      const dt = clamp(video.currentTime - lastTrackTimeRef.current, 0, 1);
+      lastTrackTimeRef.current = video.currentTime;
 
-        setTrackingSnapshot({
-          phase,
-          confidence: 0,
-          message:
-            phase === 'lost'
-              ? `Lost ${targetProfile.id}. Waiting for the same person to reappear.`
-              : `Reacquiring ${targetProfile.id}…`,
-          detections: detections.length,
-        });
-      }
+      const association = associateTarget(track, candidates, { dt, frame });
+      const nextTrack = advanceTrack(track, candidates, association, { dt, frame });
+      trackRef.current = nextTrack;
+      setTrackingSnapshot(describeTrack(nextTrack, detections.length));
 
       return true;
     } catch {
@@ -508,11 +620,31 @@ export default function App() {
     }
 
     let raf = 0;
+    const frame: FrameSize = { width: videoMeta.width, height: videoMeta.height };
 
     const render = () => {
       const sourceCanvas = overlayCanvasRef.current;
       const previewCanvas = previewCanvasRef.current;
       const video = videoRef.current;
+      const track = trackRef.current;
+
+      // Detections land a few times a second, so the on-screen box coasts along the tracked
+      // velocity between passes and eases towards each new measurement.
+      if (!track) {
+        renderBoxRef.current = null;
+      } else {
+        const elapsed = video
+          ? clamp(video.currentTime - lastTrackTimeRef.current, 0, MAX_RENDER_EXTRAPOLATION)
+          : 0;
+        const aim =
+          track.status === 'tracking'
+            ? predictBox(track.box, track.velocity, elapsed, frame)
+            : track.box;
+
+        renderBoxRef.current = renderBoxRef.current
+          ? smoothBox(renderBoxRef.current, aim, RENDER_SMOOTHING)
+          : aim;
+      }
 
       if (sourceCanvas) {
         resizeCanvas(sourceCanvas, sourceStage.size);
@@ -523,8 +655,8 @@ export default function App() {
             sourceStage.size,
             videoMeta,
             detectionsRef.current,
-            trackedBoxRef.current,
-            trackingSnapshotRef.current,
+            track,
+            renderBoxRef.current,
           );
         }
       }
@@ -533,7 +665,25 @@ export default function App() {
         resizeCanvas(previewCanvas, previewStage.size);
         const ctx = previewCanvas.getContext('2d');
         if (ctx) {
-          drawPreviewFrame(ctx, previewStage.size, video, videoMeta, trackedBoxRef.current);
+          drawPreviewFrame(ctx, previewStage.size, video, videoMeta, renderBoxRef.current);
+        }
+      }
+
+      // The recorder pulls frames straight off this canvas, so it has to be painted on every
+      // animation frame even when the tracker has nothing new to report.
+      const exportCanvas = exportCanvasRef.current;
+      if (recordingRef.current && exportCanvas && video && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        const ctx = exportCanvas.getContext('2d');
+        if (ctx) {
+          exportCropRef.current = drawExportFrame(
+            ctx,
+            video,
+            frame,
+            renderBoxRef.current,
+            exportCropRef.current,
+            PREVIEW_ASPECT_RATIO,
+            { width: exportCanvas.width, height: exportCanvas.height },
+          );
         }
       }
 
@@ -557,14 +707,39 @@ export default function App() {
       return;
     }
 
-    const timer = window.setInterval(() => {
-      void runDetection();
-    }, DETECTION_INTERVAL_MS);
+    // Run detection back to back while the video plays instead of on a fixed interval, so the
+    // box keeps up with the person for the whole clip on whatever hardware is available.
+    let active = true;
+    let raf = 0;
 
-    return () => window.clearInterval(timer);
+    const pump = async () => {
+      if (!active) {
+        return;
+      }
+
+      await runDetection();
+
+      if (!active) {
+        return;
+      }
+
+      raf = window.requestAnimationFrame(() => {
+        void pump();
+      });
+    };
+
+    void pump();
+
+    return () => {
+      active = false;
+      window.cancelAnimationFrame(raf);
+    };
   }, [isPlaying, modelPhase, videoMeta]);
 
   const sourceAspectRatio = videoMeta ? `${videoMeta.width} / ${videoMeta.height}` : '16 / 9';
+  const isExporting = exportPhase === 'recording' || exportPhase === 'finishing';
+  const canExport = Boolean(videoMeta) && Boolean(trackingSnapshot.targetId) && modelPhase === 'ready';
+  const exportPercent = Math.round(exportedFraction * 100);
 
   function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
@@ -576,6 +751,9 @@ export default function App() {
       URL.revokeObjectURL(videoUrlRef.current);
     }
 
+    finishExport(true);
+    releaseExportResult();
+
     const nextUrl = URL.createObjectURL(file);
     videoUrlRef.current = nextUrl;
     setVideoUrl(nextUrl);
@@ -584,10 +762,10 @@ export default function App() {
     setCurrentTime(0);
     setIsPlaying(false);
     setError(null);
-    trackedBoxRef.current = null;
-    targetProfileRef.current = null;
+    trackRef.current = null;
+    renderBoxRef.current = null;
     detectionsRef.current = [];
-    lostCountRef.current = 0;
+    lastTrackTimeRef.current = 0;
     nextTargetIdRef.current = 1;
     setTrackingSnapshot(defaultTrackingSnapshot);
   }
@@ -613,28 +791,31 @@ export default function App() {
     }
 
     const point = getVideoPointFromClick(event, event.currentTarget, videoMeta);
-    const detections = detectionsRef.current;
-    let candidate = choosePersonForClick(detections, point);
+    const candidate = choosePersonForClick(detectionsRef.current, point);
 
-    if (!candidate) {
-      void runDetection().then(() => {
-        const refreshedCandidate = choosePersonForClick(detectionsRef.current, point);
-
-        if (refreshedCandidate) {
-          activateTarget(refreshedCandidate);
-        } else {
-          setTrackingSnapshot({
-            phase: 'idle',
-            confidence: 0,
-            message: 'No person found at that point. Try a different frame or person.',
-            detections: detectionsRef.current.length,
-          });
-        }
-      });
+    // Only trust the cached boxes when the click actually landed on one. Otherwise the list may
+    // be from an older frame, and locking on it would capture the wrong person.
+    if (candidate && pointInBox(point, candidate.box)) {
+      activateTarget(candidate);
       return;
     }
 
-    activateTarget(candidate);
+    void runDetection().then(() => {
+      const refreshed = choosePersonForClick(detectionsRef.current, point);
+
+      if (refreshed) {
+        activateTarget(refreshed);
+        return;
+      }
+
+      setTrackingSnapshot({
+        phase: 'idle',
+        confidence: 0,
+        message: 'No person found at that point. Try a different frame or person.',
+        detections: detectionsRef.current.length,
+        targetId: null,
+      });
+    });
   }
 
   function activateTarget(candidate: Detection) {
@@ -644,23 +825,16 @@ export default function App() {
       return;
     }
 
-    const targetId = `person-${nextTargetIdRef.current}`;
+    const targetId = `person ${nextTargetIdRef.current}`;
     nextTargetIdRef.current += 1;
-    const signature = captureAppearanceSignature(video, candidate.box, videoMeta);
+    const frame: FrameSize = { width: videoMeta.width, height: videoMeta.height };
+    const signature = captureAppearanceSignature(video, candidate.box, frame);
+    const track = createTrack(targetId, candidate, signature);
 
-    targetProfileRef.current = {
-      id: targetId,
-      lastBox: candidate.box,
-      signature,
-    };
-    trackedBoxRef.current = candidate.box;
-    lostCountRef.current = 0;
-    setTrackingSnapshot({
-      phase: 'tracking',
-      confidence: candidate.score,
-      message: `Tracking ${targetId}.`,
-      detections: detectionsRef.current.length,
-    });
+    trackRef.current = track;
+    renderBoxRef.current = candidate.box;
+    lastTrackTimeRef.current = video.currentTime;
+    setTrackingSnapshot(describeTrack(track, detectionsRef.current.length));
     setError(null);
   }
 
@@ -690,9 +864,191 @@ export default function App() {
     setCurrentTime(nextTime);
   }
 
+  function releaseExportResult() {
+    if (exportUrlRef.current) {
+      URL.revokeObjectURL(exportUrlRef.current);
+      exportUrlRef.current = null;
+    }
+
+    setExportResult(null);
+    setExportedFraction(0);
+    setExportPhase('idle');
+  }
+
+  /**
+   * Taps the element's audio into a stream destination so the recorded file keeps the original
+   * soundtrack. Best effort: a browser without Web Audio simply gets a silent export.
+   */
+  function captureAudioTracks(video: HTMLVideoElement): MediaStreamTrack[] {
+    try {
+      const AudioCtor =
+        window.AudioContext ??
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+
+      if (!AudioCtor) {
+        return [];
+      }
+
+      const context = audioContextRef.current ?? new AudioCtor();
+      audioContextRef.current = context;
+
+      let tap = audioTapRef.current;
+
+      if (!tap) {
+        // A media element can only ever have one source node, so the tap is created once and
+        // reused for every later export.
+        const source = context.createMediaElementSource(video);
+        const destination = context.createMediaStreamDestination();
+        source.connect(context.destination);
+        source.connect(destination);
+        tap = { source, destination };
+        audioTapRef.current = tap;
+      }
+
+      void context.resume().catch(() => undefined);
+
+      return tap.destination.stream.getAudioTracks();
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Closes out the recorder. `discard` throws the take away, which is what a video swap wants,
+   * while the default keeps whatever was captured so an early stop still yields a file.
+   */
+  function finishExport(discard = false) {
+    recordingRef.current = false;
+    const recorder = recorderRef.current;
+    recorderRef.current = null;
+
+    if (recorder && recorder.state !== 'inactive') {
+      discardExportRef.current = discard;
+
+      if (!discard) {
+        setExportPhase('finishing');
+      }
+
+      recorder.stop();
+    }
+  }
+
+  /**
+   * Replays the clip from the start and records the crop canvas in real time, so the file the
+   * user downloads is exactly what the preview shows.
+   */
+  async function handleExport() {
+    const video = videoRef.current;
+    const track = trackRef.current;
+
+    if (!video || !videoMeta || !track) {
+      return;
+    }
+
+    if (typeof MediaRecorder === 'undefined') {
+      setError('This browser cannot record video. Try a recent Chrome, Edge, or Safari.');
+      return;
+    }
+
+    const format = pickRecordingFormat((mimeType) => MediaRecorder.isTypeSupported(mimeType));
+
+    if (!format) {
+      setError('This browser has no video format the recorder can write.');
+      return;
+    }
+
+    releaseExportResult();
+    discardExportRef.current = false;
+    setError(null);
+    setExportPhase('recording');
+
+    const size = resolveExportSize(
+      { width: videoMeta.width, height: videoMeta.height },
+      PREVIEW_ASPECT_RATIO,
+    );
+    const canvas = exportCanvasRef.current ?? document.createElement('canvas');
+    canvas.width = size.width;
+    canvas.height = size.height;
+    exportCanvasRef.current = canvas;
+    exportCropRef.current = null;
+
+    video.pause();
+    setIsPlaying(false);
+    await seekVideo(video, 0);
+    // Detect once before the tape rolls so the very first frames are already framed.
+    await runDetection();
+
+    try {
+      const stream = canvas.captureStream(EXPORT_FRAME_RATE);
+      captureAudioTracks(video).forEach((audioTrack) => {
+        stream.addTrack(audioTrack);
+      });
+
+      const recorder = new MediaRecorder(stream, { mimeType: format.mimeType });
+      chunksRef.current = [];
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: format.mimeType });
+        chunksRef.current = [];
+
+        if (discardExportRef.current) {
+          discardExportRef.current = false;
+          return;
+        }
+
+        if (blob.size === 0) {
+          setExportPhase('idle');
+          setError('Nothing was recorded. Try the export again.');
+          return;
+        }
+
+        const url = URL.createObjectURL(blob);
+        exportUrlRef.current = url;
+        setExportResult({
+          url,
+          fileName: buildDownloadFileName(fileName, format.extension),
+          size: blob.size,
+        });
+        setExportedFraction(1);
+        setExportPhase('ready');
+      };
+
+      recorder.onerror = () => {
+        recordingRef.current = false;
+        recorderRef.current = null;
+        setExportPhase('idle');
+        setError('Recording stopped unexpectedly partway through the export.');
+      };
+
+      recorderRef.current = recorder;
+      recordingRef.current = true;
+      recorder.start(1000);
+
+      await video.play();
+      setIsPlaying(true);
+    } catch {
+      recordingRef.current = false;
+      recorderRef.current = null;
+      setExportPhase('idle');
+      setError('Could not start recording for this video.');
+    }
+  }
+
+  function handleStopExport() {
+    videoRef.current?.pause();
+    setIsPlaying(false);
+    finishExport();
+  }
+
   function clearSelection() {
-    trackedBoxRef.current = null;
-    lostCountRef.current = 0;
+    trackRef.current = null;
+    renderBoxRef.current = null;
     const detections = detectionsRef.current;
 
     setTrackingSnapshot({
@@ -703,6 +1059,7 @@ export default function App() {
           ? 'Click a person in the frame to lock on.'
           : 'No person detected yet. Try a clearer frame.',
       detections: detections.length,
+      targetId: null,
     });
   }
 
@@ -713,30 +1070,73 @@ export default function App() {
     }
 
     setCurrentTime(video.currentTime);
+
+    if (recordingRef.current) {
+      setExportedFraction(exportProgress(video.currentTime, video.duration));
+    }
+  }
+
+  function handleEnded() {
+    setIsPlaying(false);
+    finishExport();
   }
 
   function handleSeeked() {
+    const video = videoRef.current;
+    const track = trackRef.current;
+
+    // A scrub is not motion the tracker can follow, so let it search the whole frame for the
+    // same person at the new timestamp instead of trusting the old position.
+    if (video && track && Math.abs(video.currentTime - lastTrackTimeRef.current) > 1) {
+      trackRef.current = {
+        ...track,
+        status: 'lost',
+        misses: LOST_AFTER_MISSES,
+        secondsSinceMatch: 1.5,
+        velocity: { x: 0, y: 0 },
+      };
+      renderBoxRef.current = null;
+      lastTrackTimeRef.current = video.currentTime;
+    }
+
     void runDetection();
   }
 
   return (
-    <main className="app-shell">
-      <section className="hero-card workspace">
-        <header className="hero-header">
-          <div>
-            <p className="eyebrow">Video crop preview</p>
-            <h1>Select a person and let the crop follow them.</h1>
-            <p className="lede">
-              Upload a video, click the person you care about, and watch the preview crop adapt as
-              they move.
-            </p>
-          </div>
+    <div className="app-shell">
+      <header className="site-nav">
+        <div className="brand">
+          <span className="brand-mark" aria-hidden="true" />
+          <span className="brand-name">Video Cropper</span>
+        </div>
 
-          <label className="upload-button">
-            <span>{fileName ? 'Replace video' : 'Choose a video'}</span>
-            <input type="file" accept="video/*" onChange={handleFileChange} />
+        {fileName ? (
+          <label className="upload-button ghost">
+            <span>Replace video</span>
+            <input type="file" accept="video/*" onChange={handleFileChange} disabled={isExporting} />
           </label>
-        </header>
+        ) : null}
+      </header>
+
+      <main className="workspace">
+        <section className="hero">
+          <p className="eyebrow">Video crop preview</p>
+          <h1>Select a person and let the crop follow them.</h1>
+          <p className="lede">
+            Upload a video, click the person you care about, and the box stays on them for the rest
+            of the clip: through crossing bystanders, and through short disappearances.
+          </p>
+
+          {fileName ? null : (
+            <div className="hero-actions">
+              <label className="upload-button">
+                <span>Choose a video</span>
+                <input type="file" accept="video/*" onChange={handleFileChange} />
+              </label>
+              <p className="hero-note">MP4, WebM, or MOV. Nothing leaves your browser.</p>
+            </div>
+          )}
+        </section>
 
         {error ? <div className="error-banner">{error}</div> : null}
 
@@ -754,11 +1154,11 @@ export default function App() {
                   : modelPhase === 'error'
                     ? 'Model error'
                     : trackingSnapshot.phase === 'tracking'
-                      ? 'Tracking'
-                      : trackingSnapshot.phase === 'reacquiring'
-                        ? 'Reacquiring'
+                      ? `Following ${trackingSnapshot.targetId}`
+                      : trackingSnapshot.phase === 'coasting'
+                        ? 'Holding through occlusion'
                         : trackingSnapshot.phase === 'lost'
-                          ? 'Lost'
+                          ? 'Searching for target'
                           : 'Ready'}
               </div>
             </div>
@@ -781,9 +1181,7 @@ export default function App() {
                     }}
                     onTimeUpdate={handleTimeUpdate}
                     onSeeked={handleSeeked}
-                    onEnded={() => {
-                      setIsPlaying(false);
-                    }}
+                    onEnded={handleEnded}
                   />
                   <canvas
                     ref={overlayCanvasRef}
@@ -799,11 +1197,21 @@ export default function App() {
             </div>
 
             <div className="controls">
-              <button type="button" className="control-button" onClick={handlePlayPause} disabled={!videoUrl}>
+              <button
+                type="button"
+                className="control-button"
+                onClick={handlePlayPause}
+                disabled={!videoUrl || isExporting}
+              >
                 {isPlaying ? 'Pause' : 'Play'}
               </button>
-              <button type="button" className="control-button secondary" onClick={clearSelection} disabled={!videoUrl}>
-                Clear selection
+              <button
+                type="button"
+                className="control-button secondary"
+                onClick={clearSelection}
+                disabled={!videoUrl || !trackingSnapshot.targetId || isExporting}
+              >
+                Pick someone else
               </button>
               <label className="seek-row">
                 <span>Seek</span>
@@ -814,7 +1222,7 @@ export default function App() {
                   step="0.01"
                   value={currentTime}
                   onChange={handleSeek}
-                  disabled={!videoMeta}
+                  disabled={!videoMeta || isExporting}
                 />
               </label>
               <div className="time-readout">
@@ -827,7 +1235,11 @@ export default function App() {
             <div className="panel-head">
               <div>
                 <p className="panel-label">Adaptive preview</p>
-                <h2>Crop follows the selected person</h2>
+                <h2>
+                  {trackingSnapshot.targetId
+                    ? `Crop locked to ${trackingSnapshot.targetId}`
+                    : 'Crop follows the selected person'}
+                </h2>
               </div>
               <div className="confidence-chip">
                 {trackingSnapshot.confidence > 0
@@ -845,9 +1257,75 @@ export default function App() {
               {trackingSnapshot.detections} person
               {trackingSnapshot.detections === 1 ? '' : 's'} seen by the last model pass
             </p>
+
+            <div className="export-block">
+              {isExporting ? (
+                <>
+                  <div className="export-actions">
+                    <button type="button" className="control-button secondary" onClick={handleStopExport}>
+                      Stop and keep
+                    </button>
+                    <span className="export-count">{exportPercent}%</span>
+                  </div>
+                  <div
+                    className="export-progress"
+                    role="progressbar"
+                    aria-label="Export progress"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={exportPercent}
+                  >
+                    <span style={{ width: `${exportPercent}%` }} />
+                  </div>
+                  <p className="export-note">
+                    {exportPhase === 'finishing'
+                      ? 'Wrapping up the file.'
+                      : 'Recording the crop while the clip plays. Keep this tab in front.'}
+                  </p>
+                </>
+              ) : (
+                <>
+                  <div className="export-actions">
+                    <button
+                      type="button"
+                      className="control-button"
+                      onClick={() => {
+                        void handleExport();
+                      }}
+                      disabled={!canExport}
+                    >
+                      {exportResult ? 'Export again' : 'Export cropped video'}
+                    </button>
+
+                    {exportResult ? (
+                      <a
+                        className="control-button secondary download-link"
+                        href={exportResult.url}
+                        download={exportResult.fileName}
+                      >
+                        Download · {formatFileSize(exportResult.size)}
+                      </a>
+                    ) : null}
+                  </div>
+
+                  <p className="export-note">
+                    {exportResult
+                      ? `${exportResult.fileName} is ready to save.`
+                      : canExport
+                        ? 'Replays the clip once from the start and records the 9:16 crop with its audio.'
+                        : 'Pick a person first, then the cropped video can be exported.'}
+                  </p>
+                </>
+              )}
+            </div>
           </article>
         </div>
-      </section>
-    </main>
+      </main>
+
+      <footer className="site-foot">
+        Detection and tracking run locally in your browser with TensorFlow.js. Videos are never
+        uploaded.
+      </footer>
+    </div>
   );
 }
