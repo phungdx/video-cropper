@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import {
   boxAspectRatio,
   clamp,
+  centerCropRect,
   computeCropRect,
   pointInBox,
   DEFAULT_CROP_ASPECT_RATIO,
@@ -34,6 +35,7 @@ import {
   type TrackCandidate,
 } from './lib/tracker';
 import type { ObjectDetection } from '@tensorflow-models/coco-ssd';
+import type { FastExportFrame } from './lib/fast-export';
 
 /** How far ahead of the last detection the box is allowed to coast on screen, in seconds. */
 const MAX_RENDER_EXTRAPOLATION = 0.25;
@@ -58,6 +60,17 @@ const PALETTE = {
 type ModelPhase = 'idle' | 'loading' | 'ready' | 'error';
 type TrackingPhase = 'idle' | 'ready' | 'tracking' | 'coasting' | 'lost';
 type ExportPhase = 'idle' | 'recording' | 'finishing' | 'ready';
+type CropMode = 'follow' | 'fixed';
+type BlurCanvases = {
+  source: HTMLCanvasElement | null;
+  blurred: HTMLCanvasElement | null;
+};
+type BlurRegion = {
+  id: number;
+  box: Box;
+  startTime: number;
+  endTime: number;
+};
 
 type ExportResult = {
   url: string;
@@ -136,6 +149,23 @@ function formatTime(seconds: number): string {
   const minutes = Math.floor(totalSeconds / 60);
   const remainder = String(totalSeconds % 60).padStart(2, '0');
   return `${minutes}:${remainder}`;
+}
+
+function formatClockTime(seconds: number): string {
+  const totalSeconds = Math.max(0, Math.ceil(seconds));
+  const hours = String(Math.floor(totalSeconds / 3600)).padStart(2, '0');
+  const minutes = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, '0');
+  const remainder = String(totalSeconds % 60).padStart(2, '0');
+  return `${hours}:${minutes}:${remainder}`;
+}
+
+function parseClockTime(value: string): number | null {
+  const match = /^(\d{2,}):([0-5]\d):([0-5]\d)$/.exec(value.trim());
+  if (!match) {
+    return null;
+  }
+
+  return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
 }
 
 function useObservedCanvasSize<T extends HTMLElement>() {
@@ -397,21 +427,198 @@ function drawPreviewFrame(
   videoMeta: VideoMeta | null,
   trackedBox: Box | null,
   aspectRatio: number,
+  cropMode: CropMode,
+  fixedCrop: Box | null,
+  blurRegions: BlurRegion[],
+  blurCanvases: BlurCanvases,
+  blurStrength: number,
 ) {
   ctx.clearRect(0, 0, canvasSize.width, canvasSize.height);
 
-  if (!video || !videoMeta || !trackedBox || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+  if (
+    !video ||
+    !videoMeta ||
+    (cropMode === 'follow' && !trackedBox) ||
+    (cropMode === 'fixed' && !fixedCrop) ||
+    video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA
+  ) {
     drawBanner(ctx, 'Preview crop', canvasSize, 'Select a person to see the adaptive crop follow them.');
     return;
   }
 
-  const crop = computeCropRect(
-    trackedBox,
-    { width: videoMeta.width, height: videoMeta.height },
-    aspectRatio,
-  );
+  const crop = cropMode === 'fixed' && fixedCrop
+    ? fixedCrop
+    : trackedBox
+      ? computeCropRect(
+          trackedBox,
+          { width: videoMeta.width, height: videoMeta.height },
+          aspectRatio,
+        )
+      : null;
+
+  if (!crop) {
+    drawBanner(ctx, 'Set your crop frame', canvasSize, 'Drag a rectangle on the source video.');
+    return;
+  }
 
   ctx.drawImage(video, crop.x, crop.y, crop.width, crop.height, 0, 0, canvasSize.width, canvasSize.height);
+  drawBlurRegions(
+    ctx,
+    video,
+    crop,
+    canvasSize,
+    blurRegions,
+    blurCanvases,
+    blurStrength,
+    video.currentTime,
+  );
+}
+
+function drawBlurRegions(
+  ctx: CanvasRenderingContext2D,
+  video: CanvasImageSource,
+  crop: Box,
+  output: CanvasSize,
+  regions: BlurRegion[],
+  canvases: BlurCanvases,
+  blurStrength: number,
+  currentTime: number,
+) {
+  const visibleRegions = regions
+    .filter((region) => currentTime >= region.startTime && currentTime <= region.endTime)
+    .map(({ box: region }) => ({
+      left: Math.max(region.x, crop.x),
+      top: Math.max(region.y, crop.y),
+      right: Math.min(region.x + region.width, crop.x + crop.width),
+      bottom: Math.min(region.y + region.height, crop.y + crop.height),
+    }))
+    .filter((region) => region.right > region.left && region.bottom > region.top);
+
+  if (visibleRegions.length === 0) {
+    return;
+  }
+
+  const sourceCanvas = canvases.source ?? (canvases.source = document.createElement('canvas'));
+  const blurredCanvas = canvases.blurred ?? (canvases.blurred = document.createElement('canvas'));
+  for (const canvas of [sourceCanvas, blurredCanvas]) {
+    if (canvas.width !== output.width) canvas.width = output.width;
+    if (canvas.height !== output.height) canvas.height = output.height;
+  }
+
+  const sourceCtx = sourceCanvas.getContext('2d');
+  const blurCtx = blurredCanvas.getContext('2d');
+  if (!sourceCtx || !blurCtx) {
+    return;
+  }
+
+  sourceCtx.clearRect(0, 0, output.width, output.height);
+  sourceCtx.drawImage(video, crop.x, crop.y, crop.width, crop.height, 0, 0, output.width, output.height);
+  blurCtx.clearRect(0, 0, output.width, output.height);
+  blurCtx.filter = `blur(${(blurStrength * output.height) / 1080}px)`;
+  blurCtx.drawImage(sourceCanvas, 0, 0);
+  blurCtx.filter = 'none';
+
+  ctx.save();
+  ctx.beginPath();
+  for (const region of visibleRegions) {
+    const x = ((region.left - crop.x) / crop.width) * output.width;
+    const y = ((region.top - crop.y) / crop.height) * output.height;
+    const width = ((region.right - region.left) / crop.width) * output.width;
+    const height = ((region.bottom - region.top) / crop.height) * output.height;
+    ctx.rect(x, y, width, height);
+  }
+  ctx.clip();
+  ctx.drawImage(blurredCanvas, 0, 0);
+  ctx.restore();
+}
+
+function drawBlurOverlay(
+  ctx: CanvasRenderingContext2D,
+  canvasSize: CanvasSize,
+  frame: FrameSize,
+  regions: BlurRegion[],
+  draft: Box | null,
+  currentTime: number,
+) {
+  const scaleX = canvasSize.width / frame.width;
+  const scaleY = canvasSize.height / frame.height;
+  ctx.save();
+  ctx.lineWidth = Math.max(2, canvasSize.width / 500);
+  ctx.setLineDash([8, 5]);
+
+  regions.forEach((entry, index) => {
+    const region = entry.box;
+    const active = currentTime >= entry.startTime && currentTime <= entry.endTime;
+    const x = region.x * scaleX;
+    const y = region.y * scaleY;
+    const width = region.width * scaleX;
+    const height = region.height * scaleY;
+    ctx.strokeStyle = active ? PALETTE.coral : 'rgba(250, 249, 245, 0.6)';
+    ctx.fillStyle = active ? 'rgba(217, 119, 87, 0.18)' : 'rgba(250, 249, 245, 0.08)';
+    ctx.fillRect(x, y, width, height);
+    ctx.strokeRect(x, y, width, height);
+    ctx.fillStyle = PALETTE.light;
+    ctx.font = `500 13px ${PALETTE.uiFont}`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(`Blur ${index + 1}`, x + 6, y - 5);
+  });
+
+  if (draft) {
+    ctx.strokeStyle = PALETTE.coral;
+    ctx.fillStyle = 'rgba(217, 119, 87, 0.18)';
+    ctx.setLineDash([8, 5]);
+    ctx.fillRect(draft.x * scaleX, draft.y * scaleY, draft.width * scaleX, draft.height * scaleY);
+    ctx.strokeRect(draft.x * scaleX, draft.y * scaleY, draft.width * scaleX, draft.height * scaleY);
+  }
+
+  ctx.restore();
+}
+
+function drawFixedCropOverlay(
+  ctx: CanvasRenderingContext2D,
+  canvasSize: CanvasSize,
+  frame: FrameSize,
+  crop: Box | null,
+) {
+  ctx.clearRect(0, 0, canvasSize.width, canvasSize.height);
+  const scaleX = canvasSize.width / frame.width;
+  const scaleY = canvasSize.height / frame.height;
+
+  if (!crop) {
+    drawBanner(ctx, 'Set your crop frame', canvasSize, 'Drag across the video to choose the fixed crop.');
+    return;
+  }
+
+  const x = crop.x * scaleX;
+  const y = crop.y * scaleY;
+  const width = crop.width * scaleX;
+  const height = crop.height * scaleY;
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(20, 20, 19, 0.58)';
+  ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
+  ctx.clearRect(x, y, width, height);
+  ctx.strokeStyle = PALETTE.coral;
+  ctx.lineWidth = Math.max(2, canvasSize.width / 500);
+  ctx.strokeRect(x, y, width, height);
+  ctx.fillStyle = PALETTE.light;
+  ctx.font = `500 14px ${PALETTE.uiFont}`;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'bottom';
+  ctx.fillText('Fixed crop', x + 8, y - 7);
+  ctx.restore();
+}
+
+function cropFromPoints(start: Point, end: Point, frame: FrameSize): Box | null {
+  const left = clamp(Math.min(start.x, end.x), 0, frame.width);
+  const top = clamp(Math.min(start.y, end.y), 0, frame.height);
+  const right = clamp(Math.max(start.x, end.x), 0, frame.width);
+  const bottom = clamp(Math.max(start.y, end.y), 0, frame.height);
+  const width = right - left;
+  const height = bottom - top;
+
+  return width >= 24 && height >= 24 ? { x: left, y: top, width, height } : null;
 }
 
 /** Resolves once the video has actually landed on the requested timestamp. */
@@ -459,11 +666,23 @@ export default function App() {
   // the recorder cannot resize its canvas mid-take, and a shape that breathed with every
   // detection would make the subject pulse.
   const cropAspectRef = useRef(DEFAULT_CROP_ASPECT_RATIO);
+  const cropModeRef = useRef<CropMode>('follow');
+  const fixedCropRef = useRef<Box | null>(null);
+  const cropDragStartRef = useRef<Point | null>(null);
+  const blurEditingRef = useRef(false);
+  const blurRegionsRef = useRef<BlurRegion[]>([]);
+  const blurDraftRef = useRef<Box | null>(null);
+  const nextBlurRegionIdRef = useRef(1);
+  const blurStrengthRef = useRef(24);
   const lastTrackTimeRef = useRef(0);
   const detectionInFlightRef = useRef(false);
   const nextTargetIdRef = useRef(1);
+  const sourceFileRef = useRef<File | null>(null);
+  const fastExportActiveRef = useRef(false);
+  const cancelFastExportRef = useRef(false);
   const videoUrlRef = useRef<string | null>(null);
   const exportCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const blurCanvasesRef = useRef<BlurCanvases>({ source: null, blurred: null });
   const exportCropRef = useRef<Box | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordingRef = useRef(false);
@@ -477,17 +696,25 @@ export default function App() {
   const [fileName, setFileName] = useState<string | null>(null);
   const [videoMeta, setVideoMeta] = useState<VideoMeta | null>(null);
   const [cropAspect, setCropAspect] = useState(DEFAULT_CROP_ASPECT_RATIO);
+  const [cropMode, setCropMode] = useState<CropMode>('follow');
+  const [fixedCrop, setFixedCrop] = useState<Box | null>(null);
+  const [blurEditing, setBlurEditing] = useState(false);
+  const [blurRegions, setBlurRegions] = useState<BlurRegion[]>([]);
+  const [blurTimeDrafts, setBlurTimeDrafts] = useState<Record<string, string>>({});
+  const [blurStrength, setBlurStrength] = useState(24);
   const [modelPhase, setModelPhase] = useState<ModelPhase>('idle');
   const [trackingSnapshot, setTrackingSnapshot] = useState<TrackingSnapshot>(defaultTrackingSnapshot);
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [exportPhase, setExportPhase] = useState<ExportPhase>('idle');
+  const [fastExportActive, setFastExportActive] = useState(false);
   const [exportedFraction, setExportedFraction] = useState(0);
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
 
   useEffect(() => {
     return () => {
+      cancelFastExportRef.current = true;
       if (videoUrlRef.current) {
         URL.revokeObjectURL(videoUrlRef.current);
       }
@@ -635,13 +862,25 @@ export default function App() {
         resizeCanvas(sourceCanvas, sourceStage.size);
         const ctx = sourceCanvas.getContext('2d');
         if (ctx) {
-          drawSourceOverlay(
+          if (cropModeRef.current === 'fixed') {
+            drawFixedCropOverlay(ctx, sourceStage.size, frame, fixedCropRef.current);
+          } else {
+            drawSourceOverlay(
+              ctx,
+              sourceStage.size,
+              videoMeta,
+              detectionsRef.current,
+              track,
+              renderBoxRef.current,
+            );
+          }
+          drawBlurOverlay(
             ctx,
             sourceStage.size,
-            videoMeta,
-            detectionsRef.current,
-            track,
-            renderBoxRef.current,
+            frame,
+            blurRegionsRef.current,
+            blurDraftRef.current,
+            video?.currentTime ?? 0,
           );
         }
       }
@@ -655,8 +894,13 @@ export default function App() {
             previewStage.size,
             video,
             videoMeta,
-            renderBoxRef.current,
+            cropModeRef.current === 'fixed' ? null : renderBoxRef.current,
             cropAspectRef.current,
+            cropModeRef.current,
+            fixedCropRef.current,
+            blurRegionsRef.current,
+            blurCanvasesRef.current,
+            blurStrengthRef.current,
           );
         }
       }
@@ -675,6 +919,17 @@ export default function App() {
             exportCropRef.current,
             cropAspectRef.current,
             { width: exportCanvas.width, height: exportCanvas.height },
+            cropModeRef.current === 'fixed' ? fixedCropRef.current : null,
+          );
+          drawBlurRegions(
+            ctx,
+            video,
+            exportCropRef.current,
+            { width: exportCanvas.width, height: exportCanvas.height },
+            blurRegionsRef.current,
+            blurCanvasesRef.current,
+            blurStrengthRef.current,
+            video.currentTime,
           );
         }
       }
@@ -730,7 +985,9 @@ export default function App() {
 
   const sourceAspectRatio = videoMeta ? `${videoMeta.width} / ${videoMeta.height}` : '16 / 9';
   const isExporting = exportPhase === 'recording' || exportPhase === 'finishing';
-  const canExport = Boolean(videoMeta) && Boolean(trackingSnapshot.targetId) && modelPhase === 'ready';
+  const canExport = Boolean(videoMeta) && (
+    cropMode === 'fixed' ? Boolean(fixedCrop) : Boolean(trackingSnapshot.targetId) && modelPhase === 'ready'
+  );
   const exportPercent = Math.round(exportedFraction * 100);
 
   function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
@@ -742,6 +999,9 @@ export default function App() {
     if (videoUrlRef.current) {
       URL.revokeObjectURL(videoUrlRef.current);
     }
+
+    cancelFastExportRef.current = true;
+    sourceFileRef.current = file;
 
     finishExport(true);
     releaseExportResult();
@@ -761,6 +1021,19 @@ export default function App() {
     nextTargetIdRef.current = 1;
     cropAspectRef.current = DEFAULT_CROP_ASPECT_RATIO;
     setCropAspect(DEFAULT_CROP_ASPECT_RATIO);
+    cropModeRef.current = 'follow';
+    setCropMode('follow');
+    fixedCropRef.current = null;
+    setFixedCrop(null);
+    blurEditingRef.current = false;
+    setBlurEditing(false);
+    blurRegionsRef.current = [];
+    setBlurRegions([]);
+    blurDraftRef.current = null;
+    nextBlurRegionIdRef.current = 1;
+    setBlurTimeDrafts({});
+    blurStrengthRef.current = 24;
+    setBlurStrength(24);
     setTrackingSnapshot(defaultTrackingSnapshot);
   }
 
@@ -779,6 +1052,9 @@ export default function App() {
   }
 
   function handleSourceClick(event: React.MouseEvent<HTMLCanvasElement>) {
+    if (cropModeRef.current === 'fixed' || blurEditingRef.current) {
+      return;
+    }
     const video = videoRef.current;
     if (!videoMeta || !video) {
       return;
@@ -809,6 +1085,186 @@ export default function App() {
         detections: detectionsRef.current.length,
         targetId: null,
       });
+    });
+  }
+
+  function handleCropModeChange(mode: CropMode) {
+    cropModeRef.current = mode;
+    setCropMode(mode);
+
+    if (mode === 'fixed' && videoMeta) {
+      const crop = fixedCropRef.current ?? centerCropRect(videoMeta, cropAspectRef.current);
+      fixedCropRef.current = crop;
+      setFixedCrop(crop);
+      cropAspectRef.current = crop.width / crop.height;
+      setCropAspect(cropAspectRef.current);
+    }
+  }
+
+  function getPointerVideoPoint(event: React.PointerEvent<HTMLCanvasElement>): Point | null {
+    if (!videoMeta) {
+      return null;
+    }
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    return {
+      x: ((event.clientX - rect.left) / rect.width) * videoMeta.width,
+      y: ((event.clientY - rect.top) / rect.height) * videoMeta.height,
+    };
+  }
+
+  function handleCropPointerDown(event: React.PointerEvent<HTMLCanvasElement>) {
+    if ((!blurEditingRef.current && cropModeRef.current !== 'fixed') || !videoMeta || isExporting) {
+      return;
+    }
+
+    const point = getPointerVideoPoint(event);
+    if (!point) {
+      return;
+    }
+
+    cropDragStartRef.current = point;
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function handleCropPointerMove(event: React.PointerEvent<HTMLCanvasElement>) {
+    const start = cropDragStartRef.current;
+    if ((!blurEditingRef.current && cropModeRef.current !== 'fixed') || !start || !videoMeta) {
+      return;
+    }
+
+    const point = getPointerVideoPoint(event);
+    if (point) {
+      const crop = cropFromPoints(start, point, videoMeta);
+      if (crop) {
+        if (blurEditingRef.current) {
+          blurDraftRef.current = crop;
+        } else {
+          fixedCropRef.current = crop;
+        }
+      }
+    }
+  }
+
+  function handleCropPointerUp(event: React.PointerEvent<HTMLCanvasElement>) {
+    const start = cropDragStartRef.current;
+    cropDragStartRef.current = null;
+    if ((!blurEditingRef.current && cropModeRef.current !== 'fixed') || !start || !videoMeta) {
+      return;
+    }
+
+    const point = getPointerVideoPoint(event);
+    const crop = point ? cropFromPoints(start, point, videoMeta) : null;
+    if (!crop) {
+      blurDraftRef.current = null;
+      return;
+    }
+
+    if (blurEditingRef.current) {
+      const duration = videoMeta.duration;
+      const startTime = Math.min(Math.floor(currentTime), Math.max(0, duration - Math.min(1, duration)));
+      const nextRegions = [
+        ...blurRegionsRef.current,
+        { id: nextBlurRegionIdRef.current, box: crop, startTime, endTime: duration },
+      ];
+      nextBlurRegionIdRef.current += 1;
+      blurRegionsRef.current = nextRegions;
+      setBlurRegions(nextRegions);
+      blurDraftRef.current = null;
+      return;
+    }
+
+    fixedCropRef.current = crop;
+    setFixedCrop(crop);
+    cropAspectRef.current = crop.width / crop.height;
+    setCropAspect(cropAspectRef.current);
+  }
+
+  function toggleBlurEditing() {
+    const nextEditing = !blurEditingRef.current;
+    blurEditingRef.current = nextEditing;
+    setBlurEditing(nextEditing);
+    blurDraftRef.current = null;
+    cropDragStartRef.current = null;
+  }
+
+  function clearBlurRegions() {
+    blurRegionsRef.current = [];
+    blurDraftRef.current = null;
+    setBlurRegions([]);
+    setBlurTimeDrafts({});
+  }
+
+  function handleBlurStrengthChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const strength = Number(event.target.value);
+    blurStrengthRef.current = strength;
+    setBlurStrength(strength);
+  }
+
+  function handleBlurRegionTimeChange(
+    id: number,
+    edge: 'startTime' | 'endTime',
+    requestedValue: number,
+  ) {
+    const duration = videoMeta?.duration ?? 0;
+    const minimumGap = Math.min(1, duration);
+    if (duration <= 0) {
+      return;
+    }
+
+    const requested = clamp(requestedValue, 0, duration);
+    const nextRegions = blurRegionsRef.current.map((region, regionIndex) => {
+      if (region.id !== id) {
+        return region;
+      }
+
+      if (edge === 'startTime') {
+        return { ...region, startTime: Math.min(requested, Math.max(0, region.endTime - minimumGap)) };
+      }
+
+      return { ...region, endTime: Math.max(requested, Math.min(duration, region.startTime + minimumGap)) };
+    });
+    blurRegionsRef.current = nextRegions;
+    setBlurRegions(nextRegions);
+  }
+
+  function removeBlurRegion(index: number) {
+    const removed = blurRegionsRef.current[index];
+    const nextRegions = blurRegionsRef.current.filter((_, regionIndex) => regionIndex !== index);
+    blurRegionsRef.current = nextRegions;
+    setBlurRegions(nextRegions);
+    if (removed) {
+      setBlurTimeDrafts((drafts) => {
+        const remaining = { ...drafts };
+        delete remaining[blurTimeDraftKey(removed.id, 'startTime')];
+        delete remaining[blurTimeDraftKey(removed.id, 'endTime')];
+        return remaining;
+      });
+    }
+  }
+
+  function blurTimeDraftKey(id: number, edge: 'startTime' | 'endTime') {
+    return `${id}:${edge}`;
+  }
+
+  function handleBlurTimeTextChange(id: number, edge: 'startTime' | 'endTime', value: string) {
+    const key = blurTimeDraftKey(id, edge);
+    setBlurTimeDrafts((drafts) => ({ ...drafts, [key]: value }));
+    const seconds = parseClockTime(value);
+    const duration = videoMeta?.duration ?? 0;
+    const maxTime = edge === 'endTime' ? Math.ceil(duration) : duration;
+    if (seconds !== null && seconds <= maxTime) {
+      if (blurRegionsRef.current.some((region) => region.id === id)) {
+        handleBlurRegionTimeChange(id, edge, seconds);
+      }
+    }
+  }
+
+  function finishBlurTimeTextEdit(id: number, edge: 'startTime' | 'endTime') {
+    const key = blurTimeDraftKey(id, edge);
+    setBlurTimeDrafts((drafts) => {
+      const { [key]: _discarded, ...remaining } = drafts;
+      return remaining;
     });
   }
 
@@ -930,6 +1386,172 @@ export default function App() {
     }
   }
 
+  async function tryFastExport(): Promise<boolean> {
+    const file = sourceFileRef.current;
+    const video = videoRef.current;
+    const track = trackRef.current;
+
+    if (
+      !file ||
+      !videoMeta ||
+      !video ||
+      (cropModeRef.current === 'follow' && (!track || !detectorRef.current))
+    ) {
+      return false;
+    }
+
+    const mode = cropModeRef.current;
+    const fixedCrop = fixedCropRef.current;
+    const frame: FrameSize = { width: videoMeta.width, height: videoMeta.height };
+    const openingCrop = mode === 'fixed'
+      ? fixedCrop ?? centerCropRect(frame, cropAspectRef.current)
+      : computeCropRect(track!.box, frame, cropAspectRef.current);
+    const outputSize = resolveExportSize(openingCrop, cropAspectRef.current);
+    const canvas = document.createElement('canvas');
+    canvas.width = outputSize.width;
+    canvas.height = outputSize.height;
+    const ctx = canvas.getContext('2d');
+    const trackingCanvas = document.createElement('canvas');
+    const trackingCtx = trackingCanvas.getContext('2d');
+
+    if (!ctx || (mode === 'follow' && !trackingCtx)) {
+      return false;
+    }
+
+    let workingTrack: TargetTrack | null = mode === 'follow' && track
+      ? {
+          ...track,
+          status: 'lost',
+          misses: LOST_AFTER_MISSES,
+          secondsSinceMatch: 1.5,
+          velocity: { x: 0, y: 0 },
+        }
+      : null;
+    let lastDetectionTime: number | null = null;
+    let renderedBox: Box | null = null;
+    let fallbackCrop: Box | null = openingCrop;
+    const fastBlurCanvases: BlurCanvases = { source: null, blurred: null };
+    cancelFastExportRef.current = false;
+    fastExportActiveRef.current = true;
+    setFastExportActive(true);
+
+    try {
+      const { exportWholeVideo } = await import('./lib/fast-export');
+      const blob = await exportWholeVideo(
+        file,
+        canvas,
+        async (frameData: FastExportFrame) => {
+          const sourceFrame: FrameSize = { width: frameData.width, height: frameData.height };
+
+          const shouldDetect =
+            mode === 'follow' &&
+            workingTrack !== null &&
+            (lastDetectionTime === null || frameData.timestamp - lastDetectionTime >= 0.2);
+          if (shouldDetect) {
+            const detectionSource = frameData.source instanceof HTMLCanvasElement
+              ? frameData.source
+              : trackingCanvas;
+
+            if (detectionSource !== frameData.source && trackingCtx) {
+              trackingCanvas.width = frameData.width;
+              trackingCanvas.height = frameData.height;
+              trackingCtx.drawImage(frameData.source, 0, 0, frameData.width, frameData.height);
+            }
+
+            const detector = detectorRef.current;
+            if (!detector) {
+              throw new Error('Person detector is unavailable.');
+            }
+
+            const { detectPeople } = await import('./lib/model');
+            const detections = await detectPeople(detector, detectionSource);
+            const candidates: TrackCandidate[] = detections.map((detection) => ({
+              detection,
+              signature: captureAppearanceSignature(frameData.source, detection.box, sourceFrame),
+            }));
+            const dt = lastDetectionTime === null ? 0 : Math.max(0, frameData.timestamp - lastDetectionTime);
+            const activeTrack = workingTrack;
+            if (!activeTrack) {
+              return;
+            }
+            const association = associateTarget(activeTrack, candidates, { dt, frame: sourceFrame });
+            workingTrack = advanceTrack(activeTrack, candidates, association, { dt, frame: sourceFrame });
+            lastDetectionTime = frameData.timestamp;
+          }
+
+          const elapsed = lastDetectionTime === null
+            ? 0
+            : clamp(frameData.timestamp - lastDetectionTime, 0, MAX_RENDER_EXTRAPOLATION);
+          const aim = workingTrack
+            ? workingTrack.status === 'tracking'
+              ? predictBox(workingTrack.box, workingTrack.velocity, elapsed, sourceFrame)
+              : workingTrack.box
+            : null;
+          renderedBox = aim
+            ? renderedBox
+              ? smoothBox(renderedBox, aim, RENDER_SMOOTHING)
+              : aim
+            : null;
+
+          fallbackCrop = drawExportFrame(
+            ctx,
+            frameData.source,
+            sourceFrame,
+            mode === 'fixed' ? null : renderedBox,
+            fallbackCrop,
+            cropAspectRef.current,
+            outputSize,
+            mode === 'fixed' ? fixedCrop : null,
+          );
+          drawBlurRegions(
+            ctx,
+            frameData.source,
+            fallbackCrop,
+            outputSize,
+            blurRegionsRef.current,
+            fastBlurCanvases,
+            blurStrengthRef.current,
+            frameData.timestamp,
+          );
+        },
+        setExportedFraction,
+        () => cancelFastExportRef.current,
+      );
+
+      fastExportActiveRef.current = false;
+      setFastExportActive(false);
+
+      if (!blob) {
+        setExportPhase('idle');
+        setExportedFraction(0);
+        return true;
+      }
+
+      const url = URL.createObjectURL(blob);
+      exportUrlRef.current = url;
+      setExportResult({
+        url,
+        fileName: buildDownloadFileName(fileName, 'mp4'),
+        size: blob.size,
+      });
+      setExportedFraction(1);
+      setExportPhase('ready');
+      return true;
+    } catch {
+      fastExportActiveRef.current = false;
+      setFastExportActive(false);
+      if (cancelFastExportRef.current) {
+        cancelFastExportRef.current = false;
+        setExportPhase('idle');
+        setExportedFraction(0);
+        return true;
+      }
+      cancelFastExportRef.current = false;
+      setExportedFraction(0);
+      return false;
+    }
+  }
+
   /**
    * Replays the clip from the start and records the crop canvas in real time, so the file the
    * user downloads is exactly what the preview shows.
@@ -938,11 +1560,24 @@ export default function App() {
     const video = videoRef.current;
     const track = trackRef.current;
 
-    if (!video || !videoMeta || !track) {
+    if (!video || !videoMeta || (cropModeRef.current === 'follow' && !track)) {
+      return;
+    }
+
+    releaseExportResult();
+    discardExportRef.current = false;
+    cancelFastExportRef.current = false;
+    setError(null);
+    setExportPhase('recording');
+    video.pause();
+    setIsPlaying(false);
+
+    if (await tryFastExport()) {
       return;
     }
 
     if (typeof MediaRecorder === 'undefined') {
+      setExportPhase('idle');
       setError('This browser cannot record video. Try a recent Chrome, Edge, or Safari.');
       return;
     }
@@ -950,28 +1585,24 @@ export default function App() {
     const format = pickRecordingFormat((mimeType) => MediaRecorder.isTypeSupported(mimeType));
 
     if (!format) {
+      setExportPhase('idle');
       setError('This browser has no video format the recorder can write.');
       return;
     }
 
-    releaseExportResult();
-    discardExportRef.current = false;
     setError(null);
-    setExportPhase('recording');
 
-    video.pause();
-    setIsPlaying(false);
     await seekVideo(video, 0);
     // Detect once before the tape rolls so the very first frames are already framed, and so the
     // canvas is sized from where the subject actually is at the start of the clip.
-    await runDetection();
+    if (cropModeRef.current === 'follow') {
+      await runDetection();
+    }
 
     const frame: FrameSize = { width: videoMeta.width, height: videoMeta.height };
-    const openingCrop = computeCropRect(
-      trackRef.current?.box ?? track.box,
-      frame,
-      cropAspectRef.current,
-    );
+    const openingCrop = cropModeRef.current === 'fixed'
+      ? fixedCropRef.current ?? centerCropRect(frame, cropAspectRef.current)
+      : computeCropRect(trackRef.current?.box ?? track!.box, frame, cropAspectRef.current);
     const size = resolveExportSize(openingCrop, cropAspectRef.current);
     const canvas = exportCanvasRef.current ?? document.createElement('canvas');
     canvas.width = size.width;
@@ -1044,14 +1675,21 @@ export default function App() {
   function handleStopExport() {
     videoRef.current?.pause();
     setIsPlaying(false);
+    if (fastExportActiveRef.current) {
+      cancelFastExportRef.current = true;
+      setExportPhase('finishing');
+      return;
+    }
     finishExport();
   }
 
   function clearSelection() {
     trackRef.current = null;
     renderBoxRef.current = null;
-    cropAspectRef.current = DEFAULT_CROP_ASPECT_RATIO;
-    setCropAspect(DEFAULT_CROP_ASPECT_RATIO);
+    if (cropModeRef.current === 'follow') {
+      cropAspectRef.current = DEFAULT_CROP_ASPECT_RATIO;
+      setCropAspect(DEFAULT_CROP_ASPECT_RATIO);
+    }
     const detections = detectionsRef.current;
 
     setTrackingSnapshot({
@@ -1166,7 +1804,11 @@ export default function App() {
               </div>
             </div>
 
-            <div className="video-stage" ref={sourceStage.ref} style={{ aspectRatio: sourceAspectRatio }}>
+            <div
+              className="video-stage"
+              ref={sourceStage.ref}
+              style={{ aspectRatio: sourceAspectRatio, minHeight: videoMeta ? 0 : undefined }}
+            >
               {videoUrl ? (
                 <>
                   <video
@@ -1188,8 +1830,12 @@ export default function App() {
                   />
                   <canvas
                     ref={overlayCanvasRef}
-                    className="overlay-canvas"
+                    className={`overlay-canvas${cropMode === 'fixed' || blurEditing ? ' fixed-crop-canvas' : ''}`}
                     onClick={handleSourceClick}
+                    onPointerDown={handleCropPointerDown}
+                    onPointerMove={handleCropPointerMove}
+                    onPointerUp={handleCropPointerUp}
+                    onPointerCancel={handleCropPointerUp}
                   />
                 </>
               ) : (
@@ -1198,6 +1844,92 @@ export default function App() {
                 </div>
               )}
             </div>
+
+            <div className="blur-tools">
+              <button
+                type="button"
+                className={`control-button secondary${blurEditing ? ' selected' : ''}`}
+                onClick={toggleBlurEditing}
+                aria-pressed={blurEditing}
+                disabled={!videoMeta || isExporting}
+              >
+                {blurEditing ? 'Done adding blur' : 'Add blur area'}
+              </button>
+              <p className="blur-help">
+                {blurEditing
+                  ? 'Drag over an area. It starts at the playhead; set its HH:MM:SS range below.'
+                  : `${blurRegions.length} blur area${blurRegions.length === 1 ? '' : 's'} · set each HH:MM:SS range`}
+              </p>
+              <label className="blur-strength-control">
+                <span>Blur strength</span>
+                <input
+                  type="range"
+                  min="4"
+                  max="64"
+                  step="1"
+                  value={blurStrength}
+                  onChange={handleBlurStrengthChange}
+                  disabled={blurRegions.length === 0 || isExporting}
+                  aria-label="Blur strength"
+                />
+                <span className="blur-strength-value">{blurStrength}</span>
+              </label>
+              <button
+                type="button"
+                className="text-button"
+                onClick={clearBlurRegions}
+                disabled={blurRegions.length === 0 || isExporting}
+              >
+                Clear areas
+              </button>
+            </div>
+
+            {blurRegions.length > 0 ? (
+              <div className="blur-region-list" aria-label="Blur area time ranges">
+                {blurRegions.map((region, index) => (
+                  <div className="blur-region-row" key={region.id}>
+                    <span className="blur-region-name">Area {index + 1}</span>
+                    <label>
+                      From
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        placeholder="HH:MM:SS"
+                        pattern="[0-9]{2,}:[0-5][0-9]:[0-5][0-9]"
+                        value={blurTimeDrafts[blurTimeDraftKey(region.id, 'startTime')] ?? formatClockTime(region.startTime)}
+                        onChange={(event) => handleBlurTimeTextChange(region.id, 'startTime', event.target.value)}
+                        onBlur={() => finishBlurTimeTextEdit(region.id, 'startTime')}
+                        disabled={isExporting}
+                        aria-label={`Area ${index + 1} start time, HH:MM:SS`}
+                      />
+                    </label>
+                    <label>
+                      To
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        placeholder="HH:MM:SS"
+                        pattern="[0-9]{2,}:[0-5][0-9]:[0-5][0-9]"
+                        value={blurTimeDrafts[blurTimeDraftKey(region.id, 'endTime')] ?? formatClockTime(region.endTime)}
+                        onChange={(event) => handleBlurTimeTextChange(region.id, 'endTime', event.target.value)}
+                        onBlur={() => finishBlurTimeTextEdit(region.id, 'endTime')}
+                        disabled={isExporting}
+                        aria-label={`Area ${index + 1} end time, HH:MM:SS`}
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      className="text-button"
+                      onClick={() => removeBlurRegion(index)}
+                      disabled={isExporting}
+                      aria-label={`Remove blur area ${index + 1}`}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
 
             <div className="controls">
               <button
@@ -1237,11 +1969,13 @@ export default function App() {
           <article className="panel preview-panel">
             <div className="panel-head">
               <div>
-                <p className="panel-label">Adaptive preview</p>
+                <p className="panel-label">Crop preview</p>
                 <h2>
-                  {trackingSnapshot.targetId
-                    ? `Crop locked to ${trackingSnapshot.targetId}`
-                    : 'Crop follows the selected person'}
+                  {cropMode === 'fixed'
+                    ? 'Fixed frame'
+                    : trackingSnapshot.targetId
+                      ? `Crop locked to ${trackingSnapshot.targetId}`
+                      : 'Crop follows the selected person'}
                 </h2>
               </div>
               <div className="confidence-chip">
@@ -1251,11 +1985,36 @@ export default function App() {
               </div>
             </div>
 
+            <div className="crop-mode-switch" role="group" aria-label="Crop mode">
+              <button
+                type="button"
+                className={`mode-button${cropMode === 'follow' ? ' active' : ''}`}
+                aria-pressed={cropMode === 'follow'}
+                onClick={() => handleCropModeChange('follow')}
+                disabled={isExporting}
+              >
+                Follow person
+              </button>
+              <button
+                type="button"
+                className={`mode-button${cropMode === 'fixed' ? ' active' : ''}`}
+                aria-pressed={cropMode === 'fixed'}
+                onClick={() => handleCropModeChange('fixed')}
+                disabled={!videoMeta || isExporting}
+              >
+                Fixed frame
+              </button>
+            </div>
+
             <div className="preview-stage" ref={previewStage.ref} style={{ aspectRatio: `${cropAspect}` }}>
               <canvas ref={previewCanvasRef} className="preview-canvas" />
             </div>
 
-            <p className="status-copy">{trackingSnapshot.message}</p>
+            <p className="status-copy">
+              {cropMode === 'fixed'
+                ? 'Drag on the source video to set the crop. This frame stays in the same place throughout the clip.'
+                : trackingSnapshot.message}
+            </p>
             <p className="status-meta">
               {trackingSnapshot.detections} person
               {trackingSnapshot.detections === 1 ? '' : 's'} seen by the last model pass
@@ -1266,7 +2025,7 @@ export default function App() {
                 <>
                   <div className="export-actions">
                     <button type="button" className="control-button secondary" onClick={handleStopExport}>
-                      Stop and keep
+                      {fastExportActive ? 'Cancel export' : 'Stop and keep'}
                     </button>
                     <span className="export-count">{exportPercent}%</span>
                   </div>
@@ -1282,8 +2041,10 @@ export default function App() {
                   </div>
                   <p className="export-note">
                     {exportPhase === 'finishing'
-                      ? 'Wrapping up the file.'
-                      : 'Recording the crop while the clip plays. Keep this tab in front.'}
+                      ? fastExportActive ? 'Canceling the render.' : 'Wrapping up the file.'
+                      : fastExportActive
+                        ? 'Rendering the complete video with the current crop and blur edits.'
+                        : 'Recording the crop while the clip plays. Keep this tab in front.'}
                   </p>
                 </>
               ) : (
@@ -1315,7 +2076,7 @@ export default function App() {
                     {exportResult
                       ? `${exportResult.fileName} is ready to save.`
                       : canExport
-                        ? 'Replays the clip once from the start and records the crop with its audio.'
+                        ? 'Renders the complete clip with its audio, crop, and blur edits.'
                         : 'Pick a person first, then the cropped video can be exported.'}
                   </p>
                 </>

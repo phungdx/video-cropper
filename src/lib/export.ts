@@ -93,9 +93,12 @@ export function drawExportFrame(
   fallbackCrop: Box | null,
   aspectRatio: number,
   output: FrameSize,
+  fixedCrop: Box | null = null,
 ): Box {
   const crop =
-    box !== null
+    fixedCrop !== null
+      ? fixedCrop
+      : box !== null
       ? computeCropRect(box, frame, aspectRatio)
       : fallbackCrop ?? centerCropRect(frame, aspectRatio);
 
